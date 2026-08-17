@@ -1,0 +1,8 @@
+node_modules
+.workbuddy
+dist
+dist-electron
+release
+.env
+*.log
+.DS_Store

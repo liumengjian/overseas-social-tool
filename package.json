@@ -1,0 +1,55 @@
+{
+  "name": "overseas-social-tool",
+  "version": "0.1.0",
+  "description": "海外社媒智能运营桌面工具 — 竞对分析/视频数据库/热点追踪/爆款拆解/高转化分析/AI剪辑/TikTok CRM",
+  "main": "dist-electron/main/main.js",
+  "author": "WorkBuddy",
+  "license": "MIT",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -p tsconfig.node.json && vite build",
+    "preview": "vite preview",
+    "electron:dev": "tsc -p tsconfig.node.json && vite build && electron .",
+    "electron:start": "electron .",
+    "pack": "npm run build && electron-builder --dir",
+    "dist": "npm run build && electron-builder"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "ffmpeg-static": "^5.2.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "electron": "^31.3.0",
+    "electron-builder": "^24.13.3",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.0"
+  },
+  "build": {
+    "appId": "com.workbuddy.overseas-social-tool",
+    "productName": "海外社媒智能运营工具",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist-electron/**/*",
+      "dist/**/*"
+    ],
+    "extraResources": [
+      { "from": ".env", "to": ".env" }
+    ],
+    "win": {
+      "target": "nsis"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}
