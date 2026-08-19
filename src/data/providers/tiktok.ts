@@ -100,7 +100,7 @@ export class TikTokProvider implements SocialProvider {
   async fetchVideos(accountUrl: string, limit = 2000): Promise<SocialVideo[]> {
     const { uniqueId, secUid } = await this.resolveIdentity(accountUrl);
     const baseParams: Record<string, string> = {
-      count: '30',
+      count: '50', // 每页 50 条（TiKhub 上限内），配合下方游标翻页拉取更多
       sort_type: '0', // 0=最新
     };
     if (secUid) baseParams.sec_user_id = secUid;
@@ -355,10 +355,14 @@ function extractList(resp: any, keys: string[]): any[] {
 function extractPagination(resp: any): { hasMore: boolean; cursor?: number } {
   let hasMore = false;
   let cursor: number | undefined;
+  // TiKhub 不同接口对「是否还有下一页」的字段类型不一致：
+  // 有的是布尔（true/false），有的是数字（has_more: 1 / 0）。
+  // 这里把「true 或 1」都视为「还有更多」，避免因为只识别布尔而少翻页（曾导致只抓到 10 条）。
+  const isMore = (v: any) => v === true || v === 1;
   const scan = (obj: any, depth: number): void => {
     if (!obj || typeof obj !== 'object' || depth > 4) return;
-    if (typeof obj.has_more === 'boolean') hasMore = hasMore || obj.has_more;
-    if (typeof obj.hasMore === 'boolean') hasMore = hasMore || obj.hasMore;
+    if (isMore(obj.has_more)) hasMore = true;
+    if (isMore(obj.hasMore)) hasMore = true;
     if (typeof obj.max_cursor === 'number') cursor = cursor ?? obj.max_cursor;
     if (typeof obj.cursor === 'number') cursor = cursor ?? obj.cursor;
     if (typeof obj.min_cursor === 'number' && cursor === undefined) cursor = obj.min_cursor;
@@ -385,6 +389,28 @@ function firstWord(text: string): string {
   return m ? m.slice(0, 20) : '';
 }
 
+// 从 TiKhub 图文帖的 image_post_info 中提取首张图片的可直链地址。
+// 关键点：display_image.url_list 里是「带签名参数（x-expires / x-signature）」的完整 CDN 直链，
+// 直接可取图；而 display_image.uri 仅是无签名的裸路径（需配合 url_prefix），裸地址访问会 403。
+// 因此必须取 url_list，且优先 jpg/png/webp 等浏览器可直接渲染的格式，避免取到 heic（多数浏览器无法预览）。
+function firstImageUrl(info: any): string | undefined {
+  const imgs: any[] = info?.images ?? [];
+  const candidates: string[] = [];
+  for (const im of imgs) {
+    const dl = im?.display_image?.url_list ?? im?.url_list;
+    if (Array.isArray(dl)) candidates.push(...dl);
+    const thumb = im?.thumbnail?.url_list;
+    if (Array.isArray(thumb)) candidates.push(...thumb);
+  }
+  // 兜底：部分接口直接在 cover 数组里给图
+  const cover: any[] = info?.cover ?? [];
+  if (Array.isArray(cover) && cover[0]?.url_list) candidates.push(...cover[0].url_list);
+  if (candidates.length === 0) return undefined;
+  // 优先浏览器可渲染的位图格式，heic 仅作最后兜底
+  const raster = candidates.filter((u) => /\.(jpe?g|png|webp|bmp|gif)(\?|$)/i.test(u));
+  return raster[0] ?? candidates[0];
+}
+
 function normalizeTikTokVideo(v: any): SocialVideo {
   // 搜索结果里视频被包在 aweme_info 中，先解包
   const raw = v?.aweme_info && typeof v.aweme_info === 'object' ? v.aweme_info : v;
@@ -409,11 +435,7 @@ function normalizeTikTokVideo(v: any): SocialVideo {
   else mediaType = 'music';
   const isVideo = mediaType === 'video';
   // 图文帖的封面/图片地址（用于预览与后续图片理解）
-  const imageUrl = !isVideo
-    ? pick(pick(raw, 'image_post_info') ?? {}, 'images')?.[0]?.url_list?.[0]
-      ?? pick(pick(raw, 'image_post_info') ?? {}, 'cover')?.[0]?.url_list?.[0]
-      ?? undefined
-    : undefined;
+  const imageUrl = !isVideo ? firstImageUrl(pick(raw, 'image_post_info')) : undefined;
   return {
     id: `tiktok_${aid}`,
     platform: 'tiktok',

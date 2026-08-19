@@ -7,7 +7,9 @@ import { InstagramProvider } from './providers/instagram';
 import { YouTubeProvider } from './providers/youtube';
 import { FacebookProvider } from './providers/facebook';
 import { TwitterProvider } from './providers/twitter';
-import { readJson, writeJson } from './store';
+import { readJson, writeJson, mediaDir } from './store';
+import { unlinkSync, existsSync } from 'fs';
+import { join } from 'path';
 import {
   AppConfig,
   HashtagStat,
@@ -191,8 +193,57 @@ export class DataService {
     }
   }
 
+  /** 写入本地落盘地址（localmedia:// 协议地址），用于「全部替换为本地路径」后播放/预览（不影响 mediaUrl 的远程分析链接） */
+  setVideoLocalMediaUrl(id: string, localMediaUrl: string): void {
+    const db = this.getVideoDb();
+    const map = new Map(db.map((v) => [v.id, v]));
+    const cur = map.get(id);
+    if (cur) {
+      cur.localMediaUrl = localMediaUrl;
+      writeJson('video_db', Array.from(map.values()));
+    }
+  }
+
+  /** 写入 ffmpeg 脱敏重新编码后的本地文件地址（localmedia:// 协议，位于 encoded 目录）；不替换原始链接 */
+  setVideoEncodedMediaUrl(id: string, localEncodedMediaUrl: string): void {
+    const db = this.getVideoDb();
+    const map = new Map(db.map((v) => [v.id, v]));
+    const cur = map.get(id);
+    if (cur) {
+      cur.localEncodedMediaUrl = localEncodedMediaUrl;
+      writeJson('video_db', Array.from(map.values()));
+    }
+  }
+
   getVideoDb(): SocialVideo[] {
     return readJson<SocialVideo[]>('video_db', []);
+  }
+
+  /** 删除视频库中的视频（支持批量传入 id 数组）；若该视频为本地落盘（localmedia://），同时删除本地文件，避免残留 */
+  deleteVideos(ids: string[]): { removed: number; localDeleted: number } {
+    if (!ids.length) return { removed: 0, localDeleted: 0 };
+    const idSet = new Set(ids);
+    const db = this.getVideoDb();
+    let localDeleted = 0;
+    const remaining = db.filter((v) => {
+      if (!idSet.has(v.id)) return true;
+      // 本地落盘的视频：尝试删除本地文件（原始落盘 + 脱敏编码后另存的编码文件）
+      for (const ref of [v.localMediaUrl, v.localEncodedMediaUrl]) {
+        const name = ref?.startsWith('localmedia://')
+          ? decodeURIComponent(ref.slice('localmedia://'.length))
+          : null;
+        if (name) {
+          try {
+            const fp = join(mediaDir(), name);
+            if (existsSync(fp)) { unlinkSync(fp); localDeleted++; }
+          } catch { /* 忽略个别文件删除失败 */ }
+        }
+      }
+      return false;
+    });
+    const removed = db.length - remaining.length;
+    if (removed > 0) writeJson('video_db', remaining);
+    return { removed, localDeleted };
   }
 }
 
@@ -202,7 +253,7 @@ export function loadConfigFromEnv(env: NodeJS.ProcessEnv): AppConfig {
   return {
     tikhubApiToken: token,
     tikhubBaseUrl: env.TIKHUB_BASE_URL ?? 'https://api.tikhub.io',
-    fetchVideoCount: Number(env.FETCH_VIDEO_COUNT ?? 30),
+    fetchVideoCount: Number(env.FETCH_VIDEO_COUNT ?? 50),
     llmApiKey: llmKey,
     llmBaseUrl: env.MINIMAX_BASE_URL ?? 'https://api.minimax.io/v1',
     llmModel: env.MINIMAX_MODEL ?? 'MiniMax-M3',

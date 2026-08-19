@@ -25,7 +25,17 @@ export interface SocialVideo {
   source: string; // 素材来源
   tags: string[];
   bgm: string;
-  mediaUrl?: string; // 可直链播放的视频/图片地址（真实抓取时填充，供大模型做理解）
+  mediaUrl?: string; // 可直链播放的视频/图片地址（真实抓取时填充，供大模型做理解）。为 TiKhub 临时直链，约 7 天后过期。
+  // 本地落盘后的媒体地址（经 localmedia:// 协议访问，永不过期）。由「全部替换为本地路径」按钮填充，
+  // 用于播放/预览/下载；MiniMax 分析时主进程会读取该本地文件并上传到 MiniMax，因此不依赖 mediaUrl 的临时直链。
+  localMediaUrl?: string;
+  // 运行时标记：localMediaUrl 指向的本地文件已不存在（被手动删除/清理），刷新时会重新校验并标记。
+  // 此时列表按「临时」展示，再次点击「全部替换为本地路径」会重新下载。
+  localMediaMissing?: boolean;
+  // ffmpeg 脱敏重新编码后的本地文件（经 localmedia:// 协议访问，位于 video_files/encoded 子目录）。
+  // 当某条视频被 MiniMax 判定为敏感、经重新编码脱敏后审核通过，会把编码文件另存到该目录并写回此字段；
+  // 后续 MiniMax 分析优先使用本文件（不再替换原视频的 localMediaUrl / mediaUrl）。
+  localEncodedMediaUrl?: string;
   isVideo?: boolean; // 是否为视频类型（false 表示图文/相册类帖子）
   // 媒体类型细分：video=视频, image=图文/相册帖, audio=纯音频, music=音乐类型。
   // 抓取时保留 video 与 image，剔除 audio / music（纯音频/音乐文件不入库）。
@@ -146,7 +156,8 @@ export type AiTaskName =
   | 'analyzeConversionVideo'
   | 'breakdownViralVideo'
   | 'analyzeOwnAccount'
-  | 'cleanTags';
+  | 'cleanTags'
+  | 'analyzeImage';
 
 export interface AppConfig {
   tikhubApiToken: string;

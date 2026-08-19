@@ -11,6 +11,8 @@ export interface EditMaterial {
   name: string;
   url?: string; // 可直链的视频地址（用于多模态画面理解 / 远程素材下载）
   filePath?: string; // 本地视频绝对路径（用于真实剪辑，优先于 url）
+  /** 关联的视频库行 id（用于降级处理成功后把「过审资源」回写视频库，后续分析优先复用） */
+  videoId?: string;
   title?: string;
   caption?: string;
   tags?: string[];

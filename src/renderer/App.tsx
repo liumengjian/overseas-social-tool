@@ -10,6 +10,7 @@ import AiEditing from './pages/AiEditing';
 import Settings from './pages/Settings';
 import WorkflowDock from './components/WorkflowDock';
 import { prefetchAll } from './hotspotStore';
+import { registerNavigate } from './navStore';
 
 type Tab = 'dashboard' | 'competitor' | 'videodb' | 'trend' | 'viral' | 'conversion' | 'own' | 'ai' | 'crm' | 'settings';
 
@@ -48,6 +49,7 @@ export default function App() {
   // 进入应用即在后台预拉取所有平台的热点数据（不阻塞 UI，结果写入全局 hotspotStore）
   useEffect(() => {
     prefetchAll();
+    registerNavigate(navigate);
   }, []);
 
   const show = (t: Tab) => (tab === t ? {} : { display: 'none' as const });
@@ -77,7 +79,10 @@ export default function App() {
             </button>
           ))}
         </nav>
-        <div className="sidebar-foot">数据来源：TiKhub API · MiniMax-M3</div>
+        <div className='sidebar-foot-container'>
+          <div className="sidebar-foot">数据来源：TiKhub API · MiniMax-M3</div>
+          <div className="sidebar-foot">开发者：Prina</div>
+        </div>
       </aside>
       <main className="content">
         <div style={show('dashboard')}><Dashboard onNavigate={navigate} /></div>

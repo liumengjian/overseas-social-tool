@@ -79,7 +79,7 @@ export class InstagramProvider implements SocialProvider {
   }
 
   private async fetchUserReels(username: string): Promise<any[]> {
-    const resp: any = await this.client.get('/api/v1/instagram/v2/fetch_user_reels', { username });
+    const resp: any = await this.client.get('/api/v1/instagram/v2/fetch_user_reels', { username, count: '50' });
     // 响应结构：resp.data.data.items
     const inner = resp?.data?.data ?? resp?.data ?? {};
     const items = inner?.items ?? inner ?? [];

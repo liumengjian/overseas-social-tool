@@ -43,7 +43,7 @@ export default function Settings() {
     return {
       tikhubApiToken: c.tikhubApiToken ?? '',
       tikhubBaseUrl: c.tikhubBaseUrl ?? '',
-      fetchVideoCount: c.fetchVideoCount ?? 30,
+      fetchVideoCount: c.fetchVideoCount ?? 50,
       llmApiKey: c.llmApiKey ?? '',
       llmBaseUrl: c.llmBaseUrl ?? '',
       llmModel: c.llmModel ?? '',
@@ -108,8 +108,8 @@ export default function Settings() {
           <Field label="Base URL" hint="大陆网络可改为 https://api.tikhub.dev">
             <input type="text" style={inputStyle} value={form?.tikhubBaseUrl ?? ''} onChange={(e) => set('tikhubBaseUrl', e.target.value)} placeholder="https://api.tikhub.io" />
           </Field>
-          <Field label="单页抓取视频数量上限">
-            <input type="number" min={1} max={50} style={inputStyle} value={form?.fetchVideoCount ?? 30} onChange={(e) => set('fetchVideoCount', e.target.value)} />
+          <Field label="默认抓取视频数量（上限 50，账号不足 50 条则全部抓取）">
+            <input type="number" min={1} max={50} style={inputStyle} value={form?.fetchVideoCount ?? 50} onChange={(e) => set('fetchVideoCount', e.target.value)} />
           </Field>
         </Card>
 

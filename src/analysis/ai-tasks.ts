@@ -3,6 +3,11 @@
 // 不在本文件做本地规则兜底（区别于旧版本地启发式），全部依赖大模型真实推理。
 import { MiniMaxClient } from '../data/minimax';
 import { AiTaskName } from '../shared/types';
+import * as fs from 'fs';
+import * as path from 'path';
+import { net, session } from 'electron';
+import * as os from 'os';
+import { mediaDir } from '../data/store';
 
 // ---------------------------------------------------------------------------
 // 模块一：竞对账号智能分类（多模态文本分析）
@@ -14,7 +19,7 @@ const ACCOUNT_SYSTEM = `你是海外社媒账号分析师，输入为社媒账�
   "account_type": "二选一：转化型账号 / 流量型账号",
   "reason": "判断账号类型依据"
 }
-输入内容：【账号简介】{{account_bio}}【样本作品】{{sample_post_content}}`;
+输入内容：【账号简介】{{account_bio}}【置顶】{{sample_post_content}}`;
 
 export interface AccountAnalysis {
   account_business_position: string;
@@ -31,7 +36,7 @@ export async function analyzeAccount(
   const sample = (payload.samplePosts?.length ? payload.samplePosts : ['（无作品数据）'])
     .map((t, i) => `${i + 1}. ${t}`)
     .join('\n');
-  const user = `【账号简介】${payload.bio || '（无简介）'}\n【样本作品】\n${sample}`;
+  const user = `【账号简介】${payload.bio || '（无简介）'}\n【置顶】\n${sample}`;
   const r = await client.chatJson(ACCOUNT_SYSTEM, user);
   return {
     account_business_position: String(r.account_business_position ?? ''),
@@ -112,13 +117,165 @@ export async function parseVideoFramesSafe(
 }
 
 // ---------------------------------------------------------------------------
+// 图文（图片）内容解析：只分析图片构图、拍摄主体、风格色调、用户吸引力、文案
+// ---------------------------------------------------------------------------
+const IMAGE_SYSTEM = `你是海外旅游图文内容分析专家，分析这张旅游相关的图片。严格输出JSON，禁止额外文字输出。输出字段说明：composition：图片构图方式（如三分法、中心对称、引导线、留白、前景/背景层次等）与画面布局；subject：图片主要拍摄主体（景点、美食、人文、人物、城市建筑等）及主体呈现方式；style_tone：画面风格与色调（明亮/暗调、冷暖、胶片感、清新等）；user_appeal：推测该图片会吸引海外用户的关注点与情绪价值；caption_suggestion：为这张图配的一句英文社媒文案建议。输出JSON结构：{
+  "composition":"",
+  "subject":"",
+  "style_tone":"",
+  "user_appeal":"",
+  "caption_suggestion":""
+}`;
+
+export interface ImageAnalysisResult {
+  composition: string; // 构图方式
+  subject: string; // 拍摄主体
+  styleTone: string; // 风格与色调
+  userAppeal: string; // 用户吸引力
+  captionSuggestion: string; // 英文社媒文案建议
+}
+
+/**
+ * 图片下载兜底通道：用 Electron session 的下载能力（与渲染进程 <img>/下载同一会话、同一网络栈）。
+ * 当 net.fetch 被 TikTok CDN 重置连接（net::ERR_CONNECTION_RESET / fetch failed）时使用——
+ * 该通道共享会话 cookie 与完整 Chromium 浏览器指纹，与浏览器预览成功走的是同一路径。
+ * 下载到系统临时目录后读字节返回，并清理临时文件。
+ */
+async function downloadImageViaSession(url: string): Promise<{ bytes: Buffer; ext: string }> {
+  const ses = session.defaultSession;
+  const tmpPath = path.join(os.tmpdir(), `oss-media-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+  return await new Promise<{ bytes: Buffer; ext: string }>((resolve, reject) => {
+    let settled = false;
+    const finish = (err?: any, ok?: boolean) => {
+      if (settled) return;
+      settled = true;
+      if (!ok) {
+        reject(err instanceof Error ? err : new Error(String(err)));
+        return;
+      }
+      try {
+        const bytes = fs.readFileSync(tmpPath);
+        const m = url.match(/\.(jpe?g|png|webp|gif|bmp)(?:\?|$)/i);
+        resolve({ bytes, ext: m ? m[1].toLowerCase() : 'jpg' });
+      } catch (e: any) {
+        reject(e);
+      } finally {
+        try { fs.unlinkSync(tmpPath); } catch { /* 清理失败忽略 */ }
+      }
+    };
+    const onWillDownload = (_e: any, item: any) => {
+      try {
+        // 兜底：个别版本/场景下 item 可能缺失，直接按失败处理，避免 "reading 'on'" 崩溃
+        if (!item || typeof item.once !== 'function') {
+          finish(new Error('下载项异常（download item 缺失）'));
+          return;
+        }
+        item.setSavePath(tmpPath);
+        item.once('done', (_ev: any, state: string) => {
+          const ok = state === 'completed';
+          finish(ok ? undefined : `下载状态 ${state}`, ok);
+        });
+      } catch (e: any) {
+        finish(e);
+      }
+    };
+    ses.once('will-download', onWillDownload);
+    try {
+      ses.downloadURL(url);
+    } catch (e: any) {
+      finish(e);
+    }
+    setTimeout(() => finish('下载超时（30s）'), 30_000);
+  });
+}
+
+/**
+ * 下载图片字节（主进程网络请求）。用于把远程签名直链（TikTok/Instagram 等）先取到本地内存，
+ * 再上传到 MiniMax 云端——避免 MiniMax 服务端直接拉取 TikTok CDN 失败（403/500/fetch url failed）。
+ * 首选 Electron net.fetch（Chromium 网络栈、遵循系统代理）；若被 CDN 重置连接（net::ERR_CONNECTION_RESET）
+ * 则回退到 session.downloadURL（与浏览器下载同栈、带 cookie 与完整浏览器指纹），尽量保证取到图。
+ */
+async function downloadImageBytes(url: string): Promise<{ bytes: Buffer; ext: string }> {
+  try {
+    const res = await net.fetch(url, {
+      redirect: 'follow',
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        Referer: 'https://www.tiktok.com/',
+        Accept: 'image/avif,image/webp,image/apng,image/png,image/*,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+    });
+    if (!res.ok) throw new Error(`下载图片失败（HTTP ${res.status}），可能无法访问该临时图链`);
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length < 64) throw new Error('下载到的图片内容异常（过小，可能不是图片）');
+    const m = url.match(/\.(jpe?g|png|webp|gif|bmp)(?:\?|$)/i);
+    const ext = m ? m[1].toLowerCase() : 'jpg';
+    return { bytes: buf, ext };
+  } catch (e: any) {
+    try {
+      return await downloadImageViaSession(url);
+    } catch (e2: any) {
+      throw new Error(
+        `下载图片失败（${e?.message ?? e}）；会话下载兜底也失败（${e2?.message ?? e2}），` +
+        `可能该图片的临时签名链接已过期，可在视频库点「全部替换为本地路径」本地化后重试`,
+      );
+    }
+  }
+}
+
+/**
+ * 图文（图片）内容解析：只聚焦于图片本身——构图、拍摄主体、风格色调与用户吸引力。
+ * 关键：图片地址一律「主进程下载字节 → 上传到 MiniMax 拿 mm_file:// 引用」再分析，
+ * 理由：远程签名直链（TikTok/Instagram CDN）MiniMax 服务端常拉取失败（fetch url failed），
+ * 主进程与用户浏览器同机，能取到图；本地落盘图片（localmedia://）同理读字节上传即可。
+ */
+export async function analyzeImage(
+  client: MiniMaxClient,
+  payload: { title: string; url?: string; localMediaUrl?: string },
+): Promise<ImageAnalysisResult> {
+  let mediaRef: string | undefined;
+
+  // 1) 本地落盘图片：读字节上传（服务端读不到 localmedia:// 协议）
+  if (payload.localMediaUrl?.startsWith('localmedia://')) {
+    const fileName = decodeURIComponent(payload.localMediaUrl.slice('localmedia://'.length));
+    const filePath = path.join(mediaDir(), fileName);
+    const resolved = path.resolve(filePath);
+    const base = path.resolve(mediaDir());
+    if (resolved !== base && !resolved.startsWith(base + path.sep)) throw new Error('非法路径');
+    const bytes = fs.readFileSync(filePath);
+    mediaRef = await client.uploadImage(bytes, fileName);
+  } else {
+    // 2) 远程直链：主进程先下载再上传，绕开 MiniMax 服务端拉取失败
+    const remote =
+      (payload.url && /^https?:\/\//.test(payload.url) ? payload.url : undefined) ??
+      (payload.localMediaUrl && /^https?:\/\//.test(payload.localMediaUrl) ? payload.localMediaUrl : undefined);
+    if (!remote) throw new Error('该图文没有可用的图片地址，无法解析');
+    const { bytes, ext } = await downloadImageBytes(remote);
+    mediaRef = await client.uploadImage(bytes, `image.${ext}`);
+  }
+
+  const user = `图片标题：${payload.title || '（无标题）'}\n（图片已作为多模态输入附加，请结合画面分析）`;
+  const r = await client.chatJsonMedia(IMAGE_SYSTEM, user, [{ type: 'image', url: mediaRef }]);
+  return {
+    composition: String(r?.composition ?? ''),
+    subject: String(r?.subject ?? ''),
+    styleTone: String(r?.style_tone ?? ''),
+    userAppeal: String(r?.user_appeal ?? ''),
+    captionSuggestion: String(r?.caption_suggestion ?? ''),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // 模块四：爆款视频智能拆解（多模态：视频直链 + 标题 + 热门评论）
 // ---------------------------------------------------------------------------
 const VIRAL_SYSTEM = `你是海外旅游短视频爆款拆解专家，分析这条面向海外用户的中国旅游短视频。可选归因标签集合只能从下面选择：["视觉冲击力","海外用户认知差","情绪价值","实用价值","文化差异","话题性"]严格输出JSON格式，禁止输出其他文字。输出字段：{
-  "first_3s_hook_summary":"总结前3秒钩子",
-  "full_video_structure":"完整视频内容结构简述",
+  "first_3s_hook_summary":"总结前3秒钩子（画面、文案/口播、BGM、情绪切入点）",
+  "main_shooting_subject":"视频主要拍摄主体：明确景点/美食/人文/城市/人物等主体，以及主体以何种方式呈现（特写、航拍、跟拍、延时等）",
+  "full_video_structure":"完整视频内容结构，必须详细拆解：按时间线或叙事阶段（开场前3秒、主体展开、高潮/转折、结尾引导）逐段说明画面内容、运镜与剪辑节奏、字幕/口播信息、BGM与情绪调动，并给出各段大致时长占比与转场方式",
   "hit_reason_tags":["从给定集合选择1-3个标签"],
-  "core_hit_logic":"爆款核心逻辑简短总结",
+  "core_hit_logic":"爆款核心逻辑总结（为什么能火：选题切入点、情绪价值、信息差、视觉冲击力或节奏把控等）",
   "reproducible_topics":["选题1","选题2","选题3","选题4","选题5"]
 }
 视频标题：{{video_title}}热门评论样本：{{top_comments}}视频资源链接：{{video_url}}`;
@@ -127,6 +284,7 @@ const VIRAL_TAGS = ['视觉冲击力', '海外用户认知差', '情绪价值', 
 
 export interface ViralBreakdownResult {
   first3sHookSummary: string;
+  mainShootingSubject: string;
   fullVideoStructure: string;
   hitReasonTags: string[];
   coreHitLogic: string;
@@ -145,10 +303,43 @@ export async function breakdownViralVideo(
     : [];
   return {
     first3sHookSummary: String(r.first_3s_hook_summary ?? ''),
+    mainShootingSubject: String(r.main_shooting_subject ?? ''),
     fullVideoStructure: String(r.full_video_structure ?? ''),
     hitReasonTags: tags,
     coreHitLogic: String(r.core_hit_logic ?? ''),
     reproducibleTopics: Array.isArray(r.reproducible_topics) ? r.reproducible_topics.map(String) : [],
+  };
+}
+
+/**
+ * 敏感感知的爆款拆解：仅做「单次多模态尝试」，**不**降级为纯文本/精简文本。
+ * 供「敏感内容自动脱敏恢复」流程判断是否需要进入 ffmpeg 预处理分支。
+ * @param mediaItems 脱敏恢复流程传入的「替代媒体」（如重新编码后的 mm_file:// 或抽帧图片集）
+ */
+export async function breakdownViralVideoSafe(
+  client: MiniMaxClient,
+  payload: { title: string; comments: string[]; url?: string },
+  mediaItems?: { type: 'video' | 'image'; url: string }[],
+): Promise<{ ok: boolean; sensitive?: boolean; error?: string; data?: ViralBreakdownResult }> {
+  const comments = payload.comments?.length ? payload.comments.map((c, i) => `${i + 1}. ${c}`).join('\n') : '（无评论样本）';
+  const user = `视频标题：${payload.title || '（无标题）'}\n热门评论样本：${comments}\n视频资源：${payload.url ? '（视频已作为多模态输入附加，请结合画面与以上标题/评论分析）' : '（未提供直链，请基于文本分析）'}`;
+  const items = mediaItems ?? (payload.url ? [{ type: 'video' as const, url: payload.url }] : []);
+  const r = await client.chatJsonStrictSafe(VIRAL_SYSTEM, user, items);
+  if (!r.ok) return { ok: false, sensitive: r.sensitive, error: r.error };
+  const d = r.data ?? {};
+  const tags = Array.isArray(d.hit_reason_tags)
+    ? d.hit_reason_tags.map(String).filter((t: string) => VIRAL_TAGS.includes(t))
+    : [];
+  return {
+    ok: true,
+    data: {
+      first3sHookSummary: String(d.first_3s_hook_summary ?? ''),
+      mainShootingSubject: String(d.main_shooting_subject ?? ''),
+      fullVideoStructure: String(d.full_video_structure ?? ''),
+      hitReasonTags: tags,
+      coreHitLogic: String(d.core_hit_logic ?? ''),
+      reproducibleTopics: Array.isArray(d.reproducible_topics) ? d.reproducible_topics.map(String) : [],
+    },
   };
 }
 
@@ -263,6 +454,8 @@ export async function runAiTask(client: MiniMaxClient, task: AiTaskName, payload
       return analyzeOwnAccount(client, payload);
     case 'cleanTags':
       return cleanTags(client, payload);
+    case 'analyzeImage':
+      return analyzeImage(client, payload);
     default:
       throw new Error(`未知 AI 任务：${task}`);
   }

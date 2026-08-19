@@ -28,27 +28,40 @@ function ffmpegBin(): string {
   if (!ffmpegStatic) {
     throw new Error('未找到 ffmpeg 二进制：请先执行 npm install 安装 ffmpeg-static（或在本机安装 ffmpeg 并放入 PATH）。');
   }
-  return ffmpegStatic as string;
+  const bin = ffmpegStatic as string;
+  if (!fs.existsSync(bin)) {
+    throw new Error(
+      `未找到 ffmpeg 可执行文件（${bin}）。ffmpeg-static 的二进制未随安装自动下载，` +
+      '请重新安装 ffmpeg-static（触发 postinstall 下载），或在本机安装 ffmpeg 并放入 PATH。',
+    );
+  }
+  return bin;
 }
 
 function download(url: string, dest: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    const proto = url.startsWith('https') ? https : http;
-    const req = proto.get(url, (res) => {
-      if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        download(res.headers.location, dest).then(resolve, reject);
-        return;
-      }
-      if (!res.statusCode || res.statusCode >= 400) {
-        reject(new Error(`素材下载失败 HTTP ${res.statusCode} (${url})`));
-        return;
-      }
-      const file = fs.createWriteStream(dest);
-      res.pipe(file);
-      file.on('finish', () => file.close(() => resolve()));
-      file.on('error', reject);
-    });
-    req.on('error', reject);
+    let req: any;
+    try {
+      const proto = url.startsWith('https') ? https : http;
+      req = proto.get(url, (res) => {
+        if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          download(res.headers.location, dest).then(resolve, reject);
+          return;
+        }
+        if (!res.statusCode || res.statusCode >= 400) {
+          reject(new Error(`素材下载失败 HTTP ${res.statusCode} (${url})`));
+          return;
+        }
+        const file = fs.createWriteStream(dest);
+        res.pipe(file);
+        file.on('finish', () => file.close(() => resolve()));
+        file.on('error', reject);
+      });
+    } catch (e) {
+      reject(e instanceof Error ? e : new Error(String(e)));
+      return;
+    }
+    req?.on('error', reject);
   });
 }
 
@@ -101,7 +114,7 @@ function runFfmpeg(args: string[]): Promise<void> {
       resolve();
     });
     // 超时保护：单个成片最长 5 分钟
-    p.on('error', reject);
+    p?.on('error', reject);
   });
 }
 

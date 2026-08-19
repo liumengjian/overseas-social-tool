@@ -12,9 +12,20 @@ export default function CompetitorAnalysis() {
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [error, setError] = useState('');
   const [includeVideos, setIncludeVideos] = useState(true); // 自动拉取账号视频作为分析依据（消耗 TiKhub 额度）
-  const pipe = useWorkflow();
+  const [busy, setBusy] = useState(false);
+  const pipe = useWorkflow('竞对账号分析');
 
   useEffect(() => { window.api.getConfig().then(setConfig); }, []);
+
+  // 跨重启恢复上次操作数据
+  useEffect(() => {
+    window.api.getJson('competitor').then((s: any) => {
+      if (!s) return;
+      if (Array.isArray(s.inputs)) setInputs(s.inputs);
+      if (Array.isArray(s.accounts)) setAccounts(s.accounts);
+      if (typeof s.includeVideos === 'boolean') setIncludeVideos(s.includeVideos);
+    }).catch(() => {});
+  }, []);
 
   function add() {
     if (!url.trim()) return;
@@ -29,52 +40,65 @@ export default function CompetitorAnalysis() {
       setError(`以下账号所属平台暂不支持（TiKhub 未提供接口）：${bad.join('；')}`);
       return;
     }
-    const runId = pipe.start();
-    setError('');
-    setAccounts(null);
-    try {
-      const db: SocialVideo[] = await window.api.getVideoDb();
-      const results: SocialAccount[] = [];
-      for (const i of inputs) {
-        const acc = await window.api.fetchAccount({ platform: i.platform, url: i.url, runId });
-        // 优先复用视频库中已抓取的该账号视频；没有则（按需）自动拉取该账号视频作为分析依据
-        let vids = db.filter((v) => v.platform === i.platform && (v.authorId === acc.uniqueId || v.url.includes(acc.uniqueId)));
-        if (vids.length === 0 && includeVideos) {
-          try {
-            const fetched = await window.api.fetchVideos({ platform: i.platform, url: i.url, limit: 2000, runId });
-            vids = fetched;
-          } catch (ve: any) {
-            setError((prev) => prev ? `${prev}\n拉取 ${acc.name} 视频失败：${ve?.message ?? ve}` : `拉取 ${acc.name} 视频失败：${ve?.message ?? ve}`);
+    setBusy(true);
+    pipe.enqueue('竞对账号分析', async (runId, signal) => {
+      setError('');
+      setAccounts(null);
+      try {
+        const db: SocialVideo[] = await window.api.getVideoDb();
+        if (signal.aborted) return;
+        const results: SocialAccount[] = [];
+        for (const i of inputs) {
+          if (signal.aborted) return;
+          const acc = await window.api.fetchAccount({ platform: i.platform, url: i.url, runId });
+          if (signal.aborted) return;
+          // 优先复用视频库中已抓取的该账号视频；没有则（按需）自动拉取该账号视频作为分析依据
+          let vids = db.filter((v) => v.platform === i.platform && (v.authorId === acc.uniqueId || v.url.includes(acc.uniqueId)));
+          if (vids.length === 0 && includeVideos) {
+            try {
+              const fetched = await window.api.fetchVideos({ platform: i.platform, url: i.url, limit: 2000, runId });
+              if (signal.aborted) return;
+              vids = fetched;
+            } catch (ve: any) {
+              if (signal.aborted) return;
+              setError((prev) => prev ? `${prev}\n拉取 ${acc.name} 视频失败：${ve?.message ?? ve}` : `拉取 ${acc.name} 视频失败：${ve?.message ?? ve}`);
+            }
           }
+          // 模块一：用 MiniMax-M3 多模态分析账号（依据简介 + 样本作品标题）
+          const samplePosts = vids.slice(0, 3).map((v) => v.title || v.caption || v.hook).filter(Boolean);
+          const analysis = await window.api.runAiTask({
+            task: 'analyzeAccount',
+            payload: { bio: acc.bio ?? '', samplePosts },
+            runId,
+          });
+          if (signal.aborted) return;
+          const isConv = analysis?.account_type === '流量型账号' ? false : true;
+          results.push({
+            ...acc,
+            category: isConv ? 'conversion' : 'traffic',
+            categoryReason: analysis?.reason ?? 'AI 未返回分类依据',
+            businessPosition: analysis?.account_business_position ?? '',
+            targetAudience: analysis?.target_audience ?? '',
+            drainageMethod: analysis?.drainage_method ?? '',
+            categoryEvidence: [
+              `粉丝：${(acc.followers ?? 0).toLocaleString()}`,
+              `作品：${acc.videoCount ?? vids.length} 条`,
+              samplePosts.length ? `置顶：${samplePosts.length} 条` : '无作品样本',
+            ],
+          });
         }
-        // 模块一：用 MiniMax-M3 多模态分析账号（依据简介 + 样本作品标题）
-        const samplePosts = vids.slice(0, 3).map((v) => v.title || v.caption || v.hook).filter(Boolean);
-        const analysis = await window.api.runAiTask({
-          task: 'analyzeAccount',
-          payload: { bio: acc.bio ?? '', samplePosts },
-          runId,
-        });
-        const isConv = analysis?.account_type === '流量型账号' ? false : true;
-        results.push({
-          ...acc,
-          category: isConv ? 'conversion' : 'traffic',
-          categoryReason: analysis?.reason ?? 'AI 未返回分类依据',
-          businessPosition: analysis?.account_business_position ?? '',
-          targetAudience: analysis?.target_audience ?? '',
-          drainageMethod: analysis?.drainage_method ?? '',
-          categoryEvidence: [
-            `粉丝：${(acc.followers ?? 0).toLocaleString()}`,
-            `作品：${acc.videoCount ?? vids.length} 条`,
-            samplePosts.length ? `样本作品：${samplePosts.length} 条` : '无作品样本',
-          ],
-        });
+        if (signal.aborted) return;
+        setAccounts(results);
+        // 持久化本次操作数据，下次打开直接展示
+        window.api.setJson('competitor', { inputs, accounts: results, includeVideos }).catch(() => {});
+      } catch (e: any) {
+        if (signal.aborted) return;
+        setError(e?.message ?? String(e));
+        throw e;
+      } finally {
+        setBusy(false);
       }
-      setAccounts(results);
-      pipe.finish();
-    } catch (e: any) {
-      setError(e?.message ?? String(e));
-      pipe.finish();
-    }
+    });
   }
 
   const conv = accounts?.filter((a) => a.category === 'conversion').length ?? 0;
@@ -106,8 +130,8 @@ export default function CompetitorAnalysis() {
             ))}
           </ul>
         )}
-        <button className="primary" onClick={analyze} disabled={pipe.state.loading || inputs.length === 0 || !config?.tokenConfigured || !config?.minimaxConfigured}>
-          {pipe.state.loading ? '分析中…' : '开始分析'}
+        <button className="primary" onClick={analyze} disabled={busy || inputs.length === 0 || !config?.tokenConfigured || !config?.minimaxConfigured}>
+          {busy ? '分析中…' : '开始分析'}
         </button>
         <label className="check">
           <input type="checkbox" checked={includeVideos} onChange={(e) => setIncludeVideos(e.target.checked)} />

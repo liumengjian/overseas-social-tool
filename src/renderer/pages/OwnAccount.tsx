@@ -12,9 +12,22 @@ export default function OwnAccount() {
   const [account, setAccount] = useState<SocialAccount | null>(null);
   const [ownVideos, setOwnVideos] = useState<SocialVideo[]>([]);
   const [analysis, setAnalysis] = useState<any>(null);
-  const pipe = useWorkflow();
+  const [busy, setBusy] = useState(false);
+  const pipe = useWorkflow('自身账号分析');
 
   React.useEffect(() => { window.api.getConfig().then(setConfig); }, []);
+
+  // 跨重启恢复上次操作数据
+  React.useEffect(() => {
+    window.api.getJson('own_account').then((s: any) => {
+      if (!s) return;
+      if (s.platform) setPlatform(s.platform);
+      if (typeof s.url === 'string') setUrl(s.url);
+      if (s.account) setAccount(s.account);
+      if (Array.isArray(s.ownVideos)) setOwnVideos(s.ownVideos);
+      if (s.analysis) setAnalysis(s.analysis);
+    }).catch(() => {});
+  }, []);
 
   async function run() {
     if (!url.trim()) return;
@@ -24,36 +37,47 @@ export default function OwnAccount() {
       setError(unsupportedMsg);
       return;
     }
-    const runId = pipe.start();
-    setError('');
-    setAccount(null);
-    setOwnVideos([]);
-    setAnalysis(null);
-    try {
-      // 仅输入账号链接：粉丝/简介/作品全部来自 TiKhub 实时拉取
-      const acc: SocialAccount = await window.api.fetchAccount({ platform, url: url.trim(), runId });
-      const videos: SocialVideo[] = await window.api.fetchVideos({ platform, url: url.trim(), limit: 2000, runId });
-      setAccount(acc);
-      setOwnVideos(videos);
+    setBusy(true);
+    pipe.enqueue('自身账号分析', async (runId, signal) => {
+      setError('');
+      setAccount(null);
+      setOwnVideos([]);
+      setAnalysis(null);
+      try {
+        // 仅输入账号链接：粉丝/简介/作品全部来自 TiKhub 实时拉取
+        const acc: SocialAccount = await window.api.fetchAccount({ platform, url: url.trim(), runId });
+        if (signal.aborted) return;
+        // 抓取上限取设置中的「默认抓取视频数量」（1~50，默认 50）；不足则全部抓取
+        const crawlLimit = Math.min(50, Math.max(1, config?.fetchVideoCount ?? 50));
+        const videos: SocialVideo[] = await window.api.fetchVideos({ platform, url: url.trim(), limit: crawlLimit, runId });
+        if (signal.aborted) return;
+        setAccount(acc);
+        setOwnVideos(videos);
 
-      // 模块六：用 MiniMax-M3 聚合分析视频数据，输出优化建议
-      const videoData = videos
-        .map((v, i) => {
-          const er = v.views > 0 ? ((v.likes + v.comments + v.shares) / v.views * 100).toFixed(2) : '0';
-          return `视频${i + 1}：标题「${v.title || v.caption}」 播放${v.views} 赞${v.likes} 评论${v.comments} 分享${v.shares} 收藏${v.favorites} 互动率${er}% 时长${v.durationSec}s 标签${(v.tags || []).join('/') || '无'}`;
-        })
-        .join('\n');
-      const res = await window.api.runAiTask({
-        task: 'analyzeOwnAccount',
-        payload: { videoData: `账号：${acc.name}｜粉丝：${acc.followers}｜作品数：${videos.length}\n${videoData}` },
-        runId,
-      });
-      setAnalysis(res);
-      pipe.finish();
-    } catch (e: any) {
-      setError(e?.message ?? String(e));
-      pipe.finish();
-    }
+        // 模块六：用 MiniMax-M3 聚合分析视频数据，输出优化建议
+        const videoData = videos
+          .map((v, i) => {
+            const er = v.views > 0 ? ((v.likes + v.comments + v.shares) / v.views * 100).toFixed(2) : '0';
+            return `视频${i + 1}：标题「${v.title || v.caption}」 播放${v.views} 赞${v.likes} 评论${v.comments} 分享${v.shares} 收藏${v.favorites} 互动率${er}% 时长${v.durationSec}s 标签${(v.tags || []).join('/') || '无'}`;
+          })
+          .join('\n');
+        const res = await window.api.runAiTask({
+          task: 'analyzeOwnAccount',
+          payload: { videoData: `账号：${acc.name}｜粉丝：${acc.followers}｜作品数：${videos.length}\n${videoData}` },
+          runId,
+        });
+        if (signal.aborted) return;
+        setAnalysis(res);
+        // 持久化本次操作数据（输入 + 结果），下次打开直接展示
+        window.api.setJson('own_account', { platform, url: url.trim(), account: acc, ownVideos: videos, analysis: res }).catch(() => {});
+      } catch (e: any) {
+        if (signal.aborted) return;
+        setError(e?.message ?? String(e));
+        throw e;
+      } finally {
+        setBusy(false);
+      }
+    });
   }
 
   const canAnalyze = config?.minimaxConfigured ?? false;
@@ -70,7 +94,7 @@ export default function OwnAccount() {
             <option value="youtube">YouTube</option><option value="facebook">Facebook</option><option value="twitter">Twitter</option>
           </select>
           <input placeholder="粘贴自身账号链接，如 https://www.tiktok.com/@yourname" value={url} onChange={(e) => setUrl(e.target.value)} style={{ flex: 1 }} />
-          <button className="primary" onClick={run} disabled={pipe.state.loading || !url.trim() || !canAnalyze}>{pipe.state.loading ? '拉取中…' : '生成对标报告'}</button>
+          <button className="primary" onClick={run} disabled={busy || !url.trim() || !canAnalyze}>{busy ? '拉取中…' : '生成对标报告'}</button>
         </div>
         {!canAnalyze && <p className="muted" style={{ marginTop: 10 }}>未配置 MiniMax（在 .env 填写 MINIMAX_API_KEY 后重启即可启用 AI 分析）。</p>}
         {error && <p className="err" style={{ marginTop: 10 }}>{error}</p>}

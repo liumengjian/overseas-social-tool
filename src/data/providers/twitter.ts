@@ -45,7 +45,7 @@ export class TwitterProvider implements SocialProvider {
   async fetchVideos(accountUrl: string, limit: number): Promise<SocialVideo[]> {
     const { uniqueId } = parseAccountUrl('twitter', accountUrl);
     const screen = uniqueId || accountUrl.trim().replace(/^@/, '');
-    const resp: any = await this.client.get('/api/v1/twitter/web/fetch_user_media', { screen_name: screen });
+    const resp: any = await this.client.get('/api/v1/twitter/web/fetch_user_media', { screen_name: screen, count: 50 });
     const tweets = collectTweets(resp?.data).slice(0, limit);
     return tweets.map((t: any, i: number) => normalizeTweet(t, i, screen));
   }

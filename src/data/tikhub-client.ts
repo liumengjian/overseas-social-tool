@@ -31,6 +31,12 @@ const ENDPOINT_LABELS: Record<string, string> = {
 };
 
 export class TikHubClient {
+  /**
+   * 当前活动的取消信号（主进程 withProgress 设置/清空）。
+   * 工作流为顺序执行（同一时刻仅一个请求），故共享单个信号是安全的。
+   */
+  static activeSignal?: AbortSignal;
+
   // 持有 AppConfig 引用、调用时实时读取，使「设置」页保存后立即生效（无需重启）。
   private cfg: AppConfig;
 
@@ -46,8 +52,9 @@ export class TikHubClient {
    * 发起 GET 请求
    * @param path 形如 /api/v1/tiktok/web/fetch_user_profile
    * @param params query 参数
+   * @param signal 可选取消信号：优先使用传入的 signal，否则用全局活动信号
    */
-  async get<T>(path: string, params: Record<string, string | number> = {}): Promise<T> {
+  async get<T>(path: string, params: Record<string, string | number> = {}, signal?: AbortSignal): Promise<T> {
     const baseUrl = (this.cfg.tikhubBaseUrl ?? 'https://api.tikhub.io').replace(/\/$/, '');
     const token = this.cfg.tikhubApiToken ?? '';
     const url = new URL(baseUrl + path);
@@ -65,6 +72,7 @@ export class TikHubClient {
           Authorization: `Bearer ${token}`,
           Accept: 'application/json',
         },
+        signal: signal ?? TikHubClient.activeSignal,
       });
       status = res.status;
       ok = res.ok;
@@ -86,6 +94,8 @@ export class TikHubClient {
       });
       return JSON.parse(raw) as T;
     } catch (e: any) {
+      // 主动取消：不追加失败 trace（弹窗已进入「已取消」状态）
+      if (signal?.aborted || e?.name === 'AbortError') throw new Error('请求已取消');
       trace.add({
         kind: 'tikhub',
         title: label,

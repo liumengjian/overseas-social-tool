@@ -21,7 +21,7 @@ export function createLocalApi(): IpcApi {
       delay<AppConfig>({
         tikhubApiToken: '',
         tikhubBaseUrl: 'https://api.tikhub.io',
-        fetchVideoCount: 30,
+        fetchVideoCount: 50,
         llmApiKey: '',
         llmBaseUrl: '',
         llmModel: '',
@@ -51,8 +51,11 @@ export function createLocalApi(): IpcApi {
     fetchVideoDetail: () => delay<{ video: SocialVideo | null; mediaUrl?: string; comments: VideoComment[] }>({ video: null, comments: [] }),
     searchVideos: () => delay<SocialVideo[]>([]),
     importVideos: () => delay<{ imported: number }>({ imported: 0 }),
-    uploadVideosToMiniMax: () => {
-      throw new Error('浏览器预览模式不支持上传视频到 MiniMax，请在桌面端运行。');
+    replaceMediaWithLocal: () => {
+      throw new Error('浏览器预览模式不支持下载视频到本地，请在桌面端运行。');
+    },
+    deleteVideos: () => {
+      throw new Error('浏览器预览模式不支持删除视频，请在桌面端运行。');
     },
 
     runAiTask: (_args: { task: AiTaskName; payload: any }) => {
@@ -92,5 +95,11 @@ export function createLocalApi(): IpcApi {
 
     onProgress: () => () => {},
     onAiChunk: () => () => {},
+    onBatchProgress: () => () => {},
+
+    // 浏览器预览模式：内存兜底，不持久化（真实持久化由桌面端 preload 经 IPC 完成）
+    getJson: () => delay<any>(null),
+    setJson: () => delay<void>(undefined),
+    cancelRun: () => delay<boolean>(true),
   };
 }

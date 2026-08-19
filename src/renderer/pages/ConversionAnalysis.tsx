@@ -22,46 +22,67 @@ export default function ConversionAnalysis() {
   const [rows, setRows] = useState<ConversionRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const pipe = useWorkflow();
+  const [busy, setBusy] = useState(false);
+  const pipe = useWorkflow('高转化分析');
 
   useEffect(() => {
-    window.api.getVideoDb().then((v) => { setVideos(v); setLoading(false); });
+    window.api.getVideoDb().then(async (v) => {
+      setVideos(v);
+      setLoading(false);
+      // 跨重启恢复上次分析结果
+      try {
+        const s = await window.api.getJson('conversion');
+        if (s && Array.isArray(s.rows) && s.rows.length) setRows(s.rows);
+      } catch { /* 忽略持久化读取失败 */ }
+    });
   }, []);
 
   async function analyze() {
-    const runId = pipe.start();
-    setError('');
-    const results: ConversionRow[] = [];
-    for (const v of videos) {
+    setBusy(true);
+    pipe.enqueue('高转化视频分析', async (runId, signal) => {
+      setError('');
+      const results: ConversionRow[] = [];
       try {
-        const detail = await window.api.fetchVideoDetail({ platform: v.platform, videoId: v.id, runId });
-        const mediaUrl = detail.mediaUrl || v.mediaUrl;
-        const comments = (detail.comments || []).slice(0, 12).map((c) => c.text);
-        const r = await window.api.runAiTask({
-          task: 'analyzeConversionVideo',
-          payload: { desc: v.caption, comments, url: mediaUrl },
-          runId,
-        });
-        const er = v.views > 0 ? Math.round(((v.likes + v.comments + v.shares) / v.views) * 10000) / 100 : 0;
-        results.push({
-          videoId: v.id,
-          title: v.title || v.caption,
-          platform: v.platform,
-          engagementRate: er,
-          productImplantMethod: r?.productImplantMethod ?? '无植入',
-          potentialConversionLevel: (['高', '中', '低'].includes(r?.potentialConversionLevel) ? r.potentialConversionLevel : '中') as '高' | '中' | '低',
-          userConsultDemands: Array.isArray(r?.userConsultDemands) ? r.userConsultDemands : [],
-          summary: r?.summary ?? '',
-          score: (LEVEL_SCORE[r?.potentialConversionLevel] ?? 60) + Math.min(15, Math.round(er)),
-        });
-      } catch (e: any) {
-        // 单条失败不影响其余，但仍记录其处理流程（已通过 progress 事件推送到前端）
-        setError((prev) => prev ? `${prev}\n部分视频分析失败：${e?.message ?? e}` : `部分视频分析失败：${e?.message ?? e}`);
+        for (const v of videos) {
+          if (signal.aborted) return;
+          try {
+            const detail = await window.api.fetchVideoDetail({ platform: v.platform, videoId: v.id, runId });
+            if (signal.aborted) return;
+            const mediaUrl = detail.mediaUrl || v.mediaUrl;
+            const comments = (detail.comments || []).slice(0, 12).map((c) => c.text);
+            const r = await window.api.runAiTask({
+              task: 'analyzeConversionVideo',
+              payload: { desc: v.caption, comments, url: mediaUrl },
+              runId,
+            });
+            if (signal.aborted) return;
+            const er = v.views > 0 ? Math.round(((v.likes + v.comments + v.shares) / v.views) * 10000) / 100 : 0;
+            results.push({
+              videoId: v.id,
+              title: v.title || v.caption,
+              platform: v.platform,
+              engagementRate: er,
+              productImplantMethod: r?.productImplantMethod ?? '无植入',
+              potentialConversionLevel: (['高', '中', '低'].includes(r?.potentialConversionLevel) ? r.potentialConversionLevel : '中') as '高' | '中' | '低',
+              userConsultDemands: Array.isArray(r?.userConsultDemands) ? r.userConsultDemands : [],
+              summary: r?.summary ?? '',
+              score: (LEVEL_SCORE[r?.potentialConversionLevel] ?? 60) + Math.min(15, Math.round(er)),
+            });
+          } catch (e: any) {
+            // 单条失败不影响其余，但仍记录其处理流程（已通过 progress 事件推送到前端）
+            if (signal.aborted) return;
+            setError((prev) => prev ? `${prev}\n部分视频分析失败：${e?.message ?? e}` : `部分视频分析失败：${e?.message ?? e}`);
+          }
+        }
+        if (signal.aborted) return;
+        results.sort((a, b) => b.score - a.score);
+        setRows(results);
+        // 持久化本次分析结果，下次打开直接展示
+        window.api.setJson('conversion', { rows: results }).catch(() => {});
+      } finally {
+        setBusy(false);
       }
-    }
-    results.sort((a, b) => b.score - a.score);
-    setRows(results);
-    pipe.finish();
+    });
   }
 
   const highCount = rows.filter((r) => r.potentialConversionLevel === '高').length;
@@ -82,11 +103,11 @@ export default function ConversionAnalysis() {
           </div>
 
           <Card title="AI 转化分析">
-            <button className="primary" onClick={analyze} disabled={pipe.state.loading || rows.length > 0}>
-              {pipe.state.loading ? '分析中（逐条调用 MiniMax-M3）…' : rows.length ? '重新分析' : '开始分析'}
+            <button className="primary" onClick={analyze} disabled={busy || rows.length > 0}>
+              {busy ? '分析中（逐条调用 MiniMax-M3）…' : rows.length ? '重新分析' : '开始分析'}
             </button>
             {error && <p className="err" style={{ marginTop: 8 }}>{error}</p>}
-            {rows.length === 0 && !pipe.state.loading && (
+            {rows.length === 0 && !busy && (
               <p className="muted" style={{ marginTop: 8 }}>点击上方按钮，对视频库全部视频逐条做转化潜力分析。</p>
             )}
           </Card>

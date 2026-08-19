@@ -19,10 +19,18 @@ export class MiniMaxClient {
   private config: AppConfig;
   /** 流式输出回调：在主进程被置为「把 token 实时推给渲染进程」，未设置则走普通一次性返回 */
   private onToken?: (text: string) => void;
+  /** 取消信号：用户在工作流弹窗点「取消」时 abort，进行中的请求（chat/upload）会被中断 */
+  private signal?: AbortSignal;
 
-  constructor(config: AppConfig, opts?: { onToken?: (text: string) => void }) {
+  constructor(config: AppConfig, opts?: { onToken?: (text: string) => void; signal?: AbortSignal }) {
     this.config = config;
     this.onToken = opts?.onToken;
+    this.signal = opts?.signal;
+  }
+
+  /** 是否已被用户取消（降级链各步骤之间可据此快速跳过） */
+  get aborted(): boolean {
+    return this.signal?.aborted ?? false;
   }
 
   private get apiKey(): string {
@@ -103,28 +111,31 @@ export class MiniMaxClient {
 
   /**
    * 严格敏感检测：仅做「单次多模态尝试」，**不**降级为纯文本/精简文本。
-   * 用于 AI 剪辑流程——当视频被判定敏感时，必须走 ffmpeg 脱敏预处理而不是悄悄丢掉视频，
-   * 因此这里要原样返回 sensitive 信号（不掩盖）。
+   * 用于 AI 剪辑流程——当视频被判定敏感或媒体不可达(500)时，必须由外层
+   * 「敏感内容自动脱敏恢复」走 ffmpeg 重编码/抽帧降级，而不是悄悄丢掉视频，
+   * 因此这里要原样返回 sensitive/error 信号（不掩盖）。
    */
   async chatJsonStrictSafe(
     system: string,
     userText: string,
     mediaItems: { type: 'video' | 'image'; url: string }[] = [],
   ): Promise<{ ok: boolean; sensitive?: boolean; error?: string; data?: any }> {
-    const core = await this.requestCore(system, userText, mediaItems);
+    const core = await this.requestCore(system, userText, mediaItems, true);
     if (core.ok) return { ok: true, data: parseJson(core.text) };
     if (core.sensitive) return { ok: false, sensitive: true };
     return { ok: false, error: `MiniMax API 调用失败 (${core.status}): ${core.raw.slice(0, 300)}` };
   }
 
   /**
-   * 核心请求编排：组装多模态内容（视频/图片），按「带媒体 → 纯文本 → 精简文本」三次降级重试。
+   * 核心请求编排：组装多模态内容（视频/图片），默认按「带媒体 → 纯文本 → 精简文本」三次降级重试。
    * 返回归一化结果 { ok, sensitive, status, text }，不直接抛错（由上层决定抛或返回信号）。
+   * @param noFallback 严格模式：仅做首次请求，不降级（供 chatJsonStrictSafe 使用）。
    */
   private async requestCore(
     system: string,
     userText: string,
     mediaItems: { type: 'video' | 'image'; url: string }[],
+    noFallback = false,
   ): Promise<{ ok: boolean; sensitive: boolean; status: number; text: string; raw: string }> {
     // 仅保留可直链的媒体：图片需 https；视频需 https 或 mm_file:// 引用
     const attach = mediaItems.filter((m) =>
@@ -149,14 +160,16 @@ export class MiniMaxClient {
           { role: 'system', content: withLang(system) },
           { role: 'user', content },
         ],
-        max_completion_tokens: 2000,
+        response_format: { type: 'json_object' },
+        // 输出上限：模型一次性返回多个方案/详细拆解内容较长，6000 易被截断导致 JSON 不完整，放宽到 8000
+        max_completion_tokens: 8000,
         temperature: 0.4,
       };
     };
 
     const endpoint = `${this.baseUrl}/chat/completions`;
     const meta = { system, userText, model: this.model, endpoint };
-    const isSensitive = (r: { status: number; raw: string }) => r.status === 422 && /sensitive/i.test(r.raw);
+    const isSensitive = (r: { status: number; raw: string }) => r.status === 422 && /(sensitive|敏感)/i.test(r.raw);
 
     // 第一次尝试（带媒体）
     let result = await this.requestJson(
@@ -165,6 +178,10 @@ export class MiniMaxClient {
       { ...meta, isMultimodal: attach.length > 0 },
       'MiniMax-M3 模型推理（多模态）',
     );
+    // 严格模式：仅一次请求，不降级（由外层脱敏恢复流程接管）
+    if (noFallback) {
+      return { ok: result.ok, sensitive: isSensitive(result), status: result.status, text: result.text, raw: result.raw };
+    }
     // 第二次：去掉媒体，用纯文本（去掉 URL，避免链接误触发审核）
     if (!result.ok && hasVideo) {
       const textOnly = await this.requestJson(
@@ -216,6 +233,7 @@ export class MiniMaxClient {
       method: 'POST',
       headers: { Authorization: `Bearer ${this.apiKey}` },
       body: form,
+      signal: this.signal,
     });
     const data: any = await res.json().catch(() => ({}));
     if (!res.ok || data?.base_resp?.status_code !== 0 || !data?.file?.file_id) {
@@ -249,6 +267,7 @@ export class MiniMaxClient {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(payload),
+        signal: this.signal,
       });
       status = res.status;
       ok = res.ok;
@@ -288,8 +307,8 @@ export class MiniMaxClient {
         summary: ok
           ? `模型返回约 ${text.length} 字：${text.slice(0, 160)}${text.length > 160 ? '…' : ''}`
           : isSensitive
-            ? '视频内容被 MiniMax 安全策略判定为敏感，已自动改用纯文本重试'
-            : `调用失败（见错误）`,
+            ? '视频内容被 MiniMax 安全策略判定为敏感，已进入降级处理'
+            : `模型调用失败（HTTP ${status === -1 ? '网络错误' : status}）`,
         error: ok ? undefined : raw.slice(0, 300),
         raw: raw.length > 4000 ? `${raw.slice(0, 4000)}\n…(已截断)` : raw,
       });
@@ -326,7 +345,8 @@ export class MiniMaxClient {
           { role: 'system', content: withLang(EDIT_SYSTEM_PROMPT) },
           { role: 'user', content },
         ],
-        max_completion_tokens: 2000,
+        response_format: { type: 'json_object' },
+        max_completion_tokens: 8000,
         temperature: 0.5,
       };
     };
@@ -377,8 +397,20 @@ export class MiniMaxClient {
     const prompt = buildEditPrompt(materials);
     const r = await this.chatJsonStrictSafe(EDIT_SYSTEM_PROMPT, prompt, mediaItems);
     if (!r.ok) return { ok: false, sensitive: r.sensitive, error: r.error };
-    return { ok: true, data: parseEditPlans(JSON.stringify(r.data), materials) };
+    return { ok: true, data: normalizeEditPlans(r.data, materials) };
   }
+}
+
+/**
+ * 把 chatJsonStrictSafe 返回的任意结构安全地标准化为 EditPlan[]：
+ * 兼容 { plans: [...] } / 纯数组 / { _raw } 兜底三种情况，避免因结构偏差导致页面拿不到方案。
+ */
+function normalizeEditPlans(raw: any, materials: EditMaterial[]): EditPlan[] {
+  if (!raw) return [];
+  if (Array.isArray(raw)) return parseEditPlans(JSON.stringify({ plans: raw }), materials);
+  if (raw && Array.isArray(raw.plans)) return parseEditPlans(JSON.stringify(raw), materials);
+  // _raw 或其它异常结构：直接按原文（或序列化后的文本）重新提取
+  return parseEditPlans(typeof raw === 'string' ? raw : JSON.stringify(raw), materials);
 }
 
 /** 从文本中去掉 http(s) 链接，避免把长串直链塞进 prompt（既省 token 也规避审核误触发） */
@@ -473,26 +505,70 @@ export function buildEditPrompt(materials: EditMaterial[]): string {
 }
 
 export function parseEditPlans(text: string, materials: EditMaterial[]): EditPlan[] {
-  const names = new Set(materials.map((m) => m.name));
   if (!text) return [];
-  try {
-    const m = text.match(/\{[\s\S]*\}/);
-    const json = m ? m[0] : text;
-    const obj = JSON.parse(json);
-    const plans = Array.isArray(obj?.plans) ? obj.plans : [];
-    return plans
-      .map((p: any): EditPlan => ({
-        direction: ['traffic', 'seed', 'conversion'].includes(p.direction) ? p.direction : 'traffic',
-        platform: ['tiktok', 'instagram', 'facebook', 'twitter'].includes(p.platform) ? p.platform : 'tiktok',
-        durationSec: Number(p.durationSec) || 15,
-        hook: typeof p.hook === 'string' ? p.hook : '',
-        clips: Array.isArray(p.clips) ? p.clips.filter((c: any) => names.has(String(c))) : [],
-        captions: Array.isArray(p.captions) ? p.captions.map(String) : [],
-        transitions: typeof p.transitions === 'string' ? p.transitions : '',
-        note: typeof p.note === 'string' ? p.note : '',
-      }))
-      .filter((p: EditPlan) => p.hook || p.clips.length);
-  } catch {
-    return [];
+  const obj = extractPlansJson(text);
+  if (!obj) return [];
+  const plans = Array.isArray(obj.plans) ? obj.plans : [];
+  if (!plans.length) return [];
+  return plans
+    .map((p: any): EditPlan => ({
+      direction: ['traffic', 'seed', 'conversion'].includes(p.direction) ? p.direction : 'traffic',
+      platform: ['tiktok', 'instagram', 'facebook', 'twitter'].includes(p.platform) ? p.platform : 'tiktok',
+      durationSec: Number(p.durationSec) || 15,
+      hook: typeof p.hook === 'string' ? p.hook : '',
+      clips: Array.isArray(p.clips) ? resolveClips(p.clips, materials) : [],
+      captions: Array.isArray(p.captions) ? p.captions.map(String) : [],
+      transitions: typeof p.transitions === 'string' ? p.transitions : '',
+      note: typeof p.note === 'string' ? p.note : '',
+    }))
+    .filter((p: EditPlan) => p.hook || p.clips.length || p.note || (p.captions && p.captions.length) || p.transitions);
+}
+
+/** 从模型返回中提取 {plans:[...]} 对象：先剥离 <think> 推理块，再稳健定位 JSON。 */
+function extractPlansJson(text: string): any {
+  const cleaned = text.replace(/<think>[\s\S]*?<\/think>/gi, '');
+  // 优先：包含 "plans" 键的 JSON 对象（允许数组内嵌套一层对象）
+  const re = /\{[^{}]*"plans"[^{}]*(?:\[[\s\S]*?\])[^{}]*\}/g;
+  let m: RegExpExecArray | null;
+  const candidates: string[] = [];
+  while ((m = re.exec(cleaned)) !== null) candidates.push(m[0]);
+  // 兜底：最后一个 { 到最后一个 } 之间
+  const lastOpen = cleaned.lastIndexOf('{');
+  const lastClose = cleaned.lastIndexOf('}');
+  if (lastOpen >= 0 && lastClose > lastOpen) candidates.push(cleaned.slice(lastOpen, lastClose + 1));
+  for (const c of candidates) {
+    try {
+      const obj = JSON.parse(c);
+      if (obj && Array.isArray(obj.plans)) return obj;
+    } catch { /* 尝试下一个候选 */ }
   }
+  return null;
+}
+
+/**
+ * 将模型给出的 clips 解析为素材名数组。模型可能返回：
+ *  - 素材全名（与 materials[i].name 一致）；
+ *  - 1-based 序号（数字或「素材N」「材料N」）；
+ *  - 部分片段名（用 includes 模糊匹配）；
+ * 任一可解析成素材名的都保留，便于 ffmpeg 渲染阶段按名定位真实素材。
+ */
+function resolveClips(raw: any[], materials: EditMaterial[]): string[] {
+  const byName = new Map(materials.map((m) => [m.name, m.name]));
+  const out: string[] = [];
+  for (const c of raw) {
+    if (c == null) continue;
+    const s = String(c).trim();
+    if (!s) continue;
+    // 1-based 序号
+    const idxMatch = s.match(/^(?:素材|材料)?\s*(\d+)\s*$/);
+    if (idxMatch) {
+      const m = materials[Number(idxMatch[1]) - 1];
+      if (m) { out.push(m.name); continue; }
+    }
+    if (byName.has(s)) { out.push(s); continue; }
+    // 模糊匹配
+    const hit = materials.find((mm) => mm.name.includes(s) || s.includes(mm.name));
+    if (hit) out.push(hit.name);
+  }
+  return out;
 }

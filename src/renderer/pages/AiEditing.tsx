@@ -23,6 +23,7 @@ function videoToMaterial(v: SocialVideo): EditMaterial {
   return {
     name: `${v.authorName} · ${v.title || v.id}`.slice(0, 60),
     url: v.mediaUrl && /^https?:\/\//.test(v.mediaUrl) ? v.mediaUrl : undefined,
+    videoId: v.id,
     title: v.title,
     caption: v.caption,
     tags: v.tags,
@@ -47,7 +48,7 @@ export default function AiEditing() {
   const [plans, setPlans] = useState<EditPlan[] | null>(null);
   const [genState, setGenState] = useState<GenState>('idle');
   const [genError, setGenError] = useState('');
-  const pipe = useWorkflow();
+  const pipe = useWorkflow('AI批量视频剪辑');
 
   const [burnCaptions, setBurnCaptions] = useState(false);
   const [renderState, setRenderState] = useState<RenderState>('idle');
@@ -105,36 +106,53 @@ export default function AiEditing() {
   }
 
   async function generate() {
-    const runId = pipe.start();
-    setGenState('loading');
-    setGenError('');
-    setPlans(null);
-    setRenderResults([]);
-    try {
-      const res = await window.api.generateEditPlan(materials, runId);
-      setPlans(res);
-      setGenState('done');
-      pipe.finish();
-    } catch (e: any) {
-      setGenError(e?.message ?? String(e));
-      setGenState('error');
-      pipe.finish();
-    }
+    pipe.enqueue('生成剪辑方案', async (runId, signal) => {
+      setGenState('loading');
+      setGenError('');
+      setPlans(null);
+      setRenderResults([]);
+      try {
+        const res = await window.api.generateEditPlan(materials, runId);
+        if (signal.aborted) return;
+        const arr = Array.isArray(res) ? res : [];
+        if (arr.length === 0) {
+          // 模型有返回但解析不出有效方案：给出模型原始返回摘要，便于定位（避免只显示空提示）
+          const last = ((res as any)?.trace ?? [])[(res as any)?.trace?.length - 1];
+          const hint = last?.summary ? `（模型原始返回：${last.summary}）` : '';
+          setPlans([]);
+          setGenError(`模型未返回有效方案，请调整素材后重试。${hint}`);
+          setGenState('error');
+          return;
+        }
+        setPlans(arr);
+        setGenState('done');
+      } catch (e: any) {
+        if (signal.aborted) return;
+        setGenError(e?.message ?? String(e));
+        setGenState('error');
+        throw e;
+      }
+    });
   }
 
   async function render(which: EditPlan[] | null) {
     if (!which || !which.length) return;
-    setRenderState('loading');
-    setRenderError('');
-    setRenderResults([]);
-    try {
-      const res = await window.api.renderEditPlan({ materials, plans: which, burnCaptions });
-      setRenderResults(res as RenderOutcome[]);
-      setRenderState('done');
-    } catch (e: any) {
-      setRenderError(e?.message ?? String(e));
-      setRenderState('error');
-    }
+    pipe.enqueue('导出成片（ffmpeg）', async (_runId, signal) => {
+      setRenderState('loading');
+      setRenderError('');
+      setRenderResults([]);
+      try {
+        const res = await window.api.renderEditPlan({ materials, plans: which, burnCaptions });
+        if (signal.aborted) return;
+        setRenderResults(res as RenderOutcome[]);
+        setRenderState('done');
+      } catch (e: any) {
+        if (signal.aborted) return;
+        setRenderError(e?.message ?? String(e));
+        setRenderState('error');
+        throw e;
+      }
+    });
   }
 
   return (
@@ -186,7 +204,7 @@ export default function AiEditing() {
           <p className="empty">视频库为空。可先在「竞对视频数据抓取与视频库」抓取竞对视频，或从上方选择本地视频。</p>
         ) : (
           <div className="table-wrap" style={{ maxHeight: 220, overflow: 'auto' }}>
-            <table className="tbl">
+            <table className="tbl tbl-ai">
               <thead><tr><th></th><th>作者</th><th>标题</th><th>平台</th><th>直链</th></tr></thead>
               <tbody>
                 {db.map((v) => (

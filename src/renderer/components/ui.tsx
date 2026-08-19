@@ -47,11 +47,44 @@ export function platformLabel(p: string): string {
   return { tiktok: 'TikTok', instagram: 'Instagram', youtube: 'YouTube', facebook: 'Facebook', twitter: 'Twitter' }[p] ?? p;
 }
 
+/** 将 ISO 字符串格式化为「YYYY-MM-DD HH:mm」本地展示（失败回退为原始值） */
+export function formatDateTime(iso?: string): string {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '—';
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
 /** 从任意 IPC 返回值/错误对象中安全取出 trace 步骤 */
 export function extractTrace(x: any): TraceStep[] {
   const t = x?.trace;
   return Array.isArray(t) ? t : [];
 }
+
+/**
+ * 将 MiniMax 返回的结构化文本（含「1、2、3、4、5」式编号列表 / 换行）逐行展示：
+ * - 先按换行拆分；
+ * - 一行内若连续出现多个「数字+顿号/点/括号」编号（如 1、xxx2、yyy3、zzz），再按编号拆开；
+ * - 每个片段独占一行，保留原文编号，长内容自动换行。
+ */
+export function StructuredText({ text, empty = '—' }: { text?: string | null; empty?: string }) {
+  if (!text || !text.trim()) return <span className="muted">{empty}</span>;
+  const segs = text
+    .split(/\r?\n/)
+    .flatMap((line) => line.split(/(?=\s*\d+[、.)）]\s*\S)/))
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  if (segs.length === 0) return <span className="muted">{empty}</span>;
+  return (
+    <div className="struct-block">
+      {segs.map((s, i) => (
+        <div key={i} className="struct-line">{s}</div>
+      ))}
+    </div>
+  );
+}
+
 
 /**
  * 处理流程面板：折叠展示本次分析「数据抓取（TiKhub）/ AI 推理（MiniMax-M3）」的实际调用。

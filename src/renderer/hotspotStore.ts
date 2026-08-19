@@ -4,7 +4,8 @@
 // 预拉取会通过 workflowStore 发起工作流，使「实时工作流」面板能看到进度。
 import { useSyncExternalStore } from 'react';
 import type { HashtagStat, Platform, TrendTopic } from '../shared/types';
-import { startWorkflow, finishWorkflow } from './workflowStore';
+import { enqueueWorkflow } from './workflowStore';
+import { platformLabel } from './components/ui';
 
 export interface TrendCache {
   loading: boolean;
@@ -65,16 +66,26 @@ export function prefetchAll(accounts?: string[]) {
   });
   if (!toFetch.length) return;
 
-  // 启动工作流，让面板显示预拉取进度
-  const rid = startWorkflow('热点数据预拉取');
-  const ps = toFetch.map((p) => fetchOne(p, p === 'instagram' ? accounts : undefined, rid));
-  // 全部完成后结束工作流（无论成功失败）
-  Promise.allSettled(ps).finally(() => finishWorkflow());
+  // 入队一个工作流，让面板显示预拉取进度（所有平台共享同一 runId，全部完成后工作流结束）
+  enqueueWorkflow({
+    title: '热点数据预拉取',
+    module: '热点与Tag追踪',
+    run: async (runId) => {
+      const ps = toFetch.map((p) => fetchOne(p, p === 'instagram' ? accounts : undefined, runId));
+      await Promise.allSettled(ps);
+    },
+  });
 }
 
-/** 强制刷新某一平台（用于「重新获取数据」按钮）。返回 Promise 便于 UI 等待。 */
-export function refresh(platform: Platform, accounts?: string[]): Promise<void> {
-  return fetchOne(platform, accounts);
+/** 强制刷新某一平台（用于「重新获取数据」按钮）。通过工作流队列发起，使「实时工作流」面板能展示进度与步骤；若当前已有工作流进行中，则排队等待其完成后顺序执行。 */
+export function refresh(platform: Platform, accounts?: string[]): void {
+  enqueueWorkflow({
+    title: `重新获取热点（${platformLabel(platform)}）`,
+    module: '热点与Tag追踪',
+    run: async (runId) => {
+      await fetchOne(platform, accounts, runId);
+    },
+  });
 }
 
 /** 仅在「尚未加载且未在加载中」时拉取一次（供页面切换时兜底，避免与后台预拉取重复） */

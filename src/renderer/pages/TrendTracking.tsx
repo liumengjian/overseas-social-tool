@@ -29,7 +29,7 @@ export default function TrendTracking() {
   // 模块三：AI 标签清洗与关联推荐
   const [cleanResult, setCleanResult] = useState<any>(null);
   const [cleanError, setCleanError] = useState('');
-  const pipe = useWorkflow();
+  const pipe = useWorkflow('热点与Tag追踪');
 
   // 热点数据来自全局后台缓存（进入应用即已预拉取）：直接从缓存读取，不重复请求
   const tc = useTrendCache(platform);
@@ -64,20 +64,22 @@ export default function TrendTracking() {
       setCleanError('暂无可清洗的标签（请先拉取热点数据）');
       return;
     }
-    const runId = pipe.start();
-    setCleanError('');
-    try {
-      const res = await window.api.runAiTask({
-        task: 'cleanTags',
-        payload: { rawTags: Array.from(raw), business: '面向海外用户的中国入境旅游内容' },
-        runId,
-      });
-      setCleanResult(res);
-      pipe.finish();
-    } catch (e: any) {
-      setCleanError(e?.message ?? String(e));
-      pipe.finish();
-    }
+    pipe.enqueue('清洗标签', async (runId, signal) => {
+      setCleanError('');
+      try {
+        const res = await window.api.runAiTask({
+          task: 'cleanTags',
+          payload: { rawTags: Array.from(raw), business: '面向海外用户的中国入境旅游内容' },
+          runId,
+        });
+        if (signal.aborted) return;
+        setCleanResult(res);
+      } catch (e: any) {
+        if (signal.aborted) return;
+        setCleanError(e?.message ?? String(e));
+        throw e;
+      }
+    });
   }
 
   const summary = summarizeTrends(trends, hashtags);

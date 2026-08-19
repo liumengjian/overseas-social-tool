@@ -1,0 +1,14 @@
+{
+  "name": "overseas-social-tool",
+  "version": "0.1.0",
+  "description": "海外社媒智能运营桌面工具 — 竞对分析/视频数据库/热点追踪/爆款拆解/高转化分析/AI剪辑/TikTok CRM",
+  "main": "dist-electron/main/main.js",
+  "author": "WorkBuddy",
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "ffmpeg-static": "^5.2.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  }
+}

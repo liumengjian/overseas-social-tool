@@ -59,6 +59,7 @@ export class YouTubeProvider implements SocialProvider {
     const resp: any = await this.client.get('/api/v1/youtube/web_v2/get_channel_videos', {
       channel_id: channelId,
       type: 'video',
+      count: '50', // 显式指定每页数量，覆盖 TiKhub 默认的 10 条
     });
     const items = resp?.data?.videos ?? resp?.videos ?? [];
     return (Array.isArray(items) ? items : []).slice(0, limit).map((v: any) => normalizeYtVideo(v));
