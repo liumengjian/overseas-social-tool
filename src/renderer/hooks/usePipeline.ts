@@ -10,9 +10,9 @@
 //     pipe.finish();                           // 结束（loading=false）
 //   }
 //   // 渲染：<Pipeline state={pipe.state} />
-import { useCallback, useEffect, useRef, useState } from 'react';
-import type { AiChunkEvent, ProgressEvent } from '../../shared/ipc';
-import type { TraceStep } from '../../shared/trace';
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { AiChunkEvent, ProgressEvent } from "../../shared/ipc";
+import type { TraceStep } from "../../shared/trace";
 
 export interface PipelineState {
   loading: boolean;
@@ -22,12 +22,19 @@ export interface PipelineState {
 }
 
 function genRunId(): string {
-  return 'run-' + Math.random().toString(36).slice(2) + '-' + Date.now().toString(36);
+  return (
+    "run-" + Math.random().toString(36).slice(2) + "-" + Date.now().toString(36)
+  );
 }
 
 export function usePipeline() {
-  const [state, setState] = useState<PipelineState>({ loading: false, steps: [], aiText: '', error: '' });
-  const runIdRef = useRef<string>('');
+  const [state, setState] = useState<PipelineState>({
+    loading: false,
+    steps: [],
+    aiText: "",
+    error: "",
+  });
+  const runIdRef = useRef<string>("");
 
   // 订阅 IPC 事件（仅挂载一次）；按当前 runId 过滤，避免串台
   useEffect(() => {
@@ -48,12 +55,18 @@ export function usePipeline() {
   /** 开始一次新的工作流：清空状态并返回本次 runId（应传给所有相关 IPC 调用） */
   const start = useCallback((): string => {
     runIdRef.current = genRunId();
-    setState({ loading: true, steps: [], aiText: '', error: '' });
+    setState({ loading: true, steps: [], aiText: "", error: "" });
     return runIdRef.current;
   }, []);
 
-  const finish = useCallback(() => setState((s) => ({ ...s, loading: false })), []);
-  const fail = useCallback((err: string) => setState((s) => ({ ...s, loading: false, error: err })), []);
+  const finish = useCallback(
+    () => setState((s) => ({ ...s, loading: false })),
+    [],
+  );
+  const fail = useCallback(
+    (err: string) => setState((s) => ({ ...s, loading: false, error: err })),
+    [],
+  );
 
   return { state, start, finish, fail, runIdRef };
 }

@@ -1,154 +1,330 @@
-import React, { useEffect, useState } from 'react';
-import { Card, Badge, Spinner, Empty, platformLabel } from '../components/ui';
-import { SocialVideo } from '../../shared/types';
-import { useWorkflow } from '../workflowStore';
+import React, { useEffect, useState } from "react";
+import {
+  Card,
+  Empty,
+  Spinner,
+  StructuredText,
+  formatDateTime,
+  platformLabel,
+} from "../components/ui";
+import {
+  AppConfig,
+  Platform,
+  SocialVideo,
+  platformConfigured,
+} from "../../shared/types";
+import { parseVideoUrl } from "../../data/parse-url";
+import { useWorkflow } from "../workflowStore";
+import { onVideoDbUpdated } from "../videoDbEvents";
 
-interface ConversionRow {
-  videoId: string;
-  title: string;
-  platform: string;
-  engagementRate: number;
+type ConversionResult = {
   productImplantMethod: string;
-  potentialConversionLevel: '高' | '中' | '低';
+  conversionPath: string;
+  potentialConversionLevel: "高" | "中" | "低";
   userConsultDemands: string[];
   summary: string;
-  score: number;
+};
+
+function emptyVideo(platform: Platform, url: string, title = ""): SocialVideo {
+  return {
+    id: platform + "_url_" + Date.now(),
+    platform,
+    authorId: "",
+    authorName: "",
+    url,
+    publishTime: "",
+    title,
+    caption: title,
+    hook: "",
+    views: 0,
+    likes: 0,
+    comments: 0,
+    shares: 0,
+    favorites: 0,
+    durationSec: 0,
+    structure: "",
+    source: "链接",
+    tags: [],
+    bgm: "",
+    isVideo: true,
+    mediaType: "video",
+  };
 }
 
-const LEVEL_SCORE: Record<string, number> = { '高': 85, '中': 60, '低': 35 };
+function normalizeUrl(url: string): string {
+  return url.trim().replace(/\/+$/, "");
+}
 
 export default function ConversionAnalysis() {
   const [videos, setVideos] = useState<SocialVideo[]>([]);
-  const [rows, setRows] = useState<ConversionRow[]>([]);
+  const [selectedId, setSelectedId] = useState("");
+  const [url, setUrl] = useState("");
+  const [config, setConfig] = useState<AppConfig | null>(null);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
-  const pipe = useWorkflow('高转化分析');
+  const [error, setError] = useState("");
+  const [result, setResult] = useState<ConversionResult | null>(null);
+  const [info, setInfo] = useState<SocialVideo | null>(null);
+  const pipe = useWorkflow("高转化分析");
 
   useEffect(() => {
-    window.api.getVideoDb().then(async (v) => {
-      setVideos(v);
-      setLoading(false);
-      // 跨重启恢复上次分析结果
-      try {
-        const s = await window.api.getJson('conversion');
-        if (s && Array.isArray(s.rows) && s.rows.length) setRows(s.rows);
-      } catch { /* 忽略持久化读取失败 */ }
-    });
+    Promise.all([window.api.getVideoDb(), window.api.getConfig()]).then(
+      ([db, cfg]) => {
+        setVideos(db);
+        setConfig(cfg);
+        if (db[0]) setSelectedId(db[0].id);
+        setLoading(false);
+      },
+    );
   }, []);
 
-  async function analyze() {
-    setBusy(true);
-    pipe.enqueue('高转化视频分析', async (runId, signal) => {
-      setError('');
-      const results: ConversionRow[] = [];
+  useEffect(
+    () =>
+      onVideoDbUpdated(() => {
+        window.api.getVideoDb().then((db) => {
+          setVideos(db);
+          setSelectedId((current) =>
+            current && db.some((v) => v.id === current)
+              ? current
+              : (db[0]?.id ?? ""),
+          );
+          setInfo((current) =>
+            current
+              ? (db.find((v) => v.id === current.id) ?? current)
+              : current,
+          );
+        });
+      }),
+    [],
+  );
+
+  async function analyzeLibraryVideo(video: SocialVideo) {
+    if (video.platform === "facebook") {
+      setError("暂不支持 Facebook 平台的数据抓取与业务分析。");
+      return;
+    }
+    await analyzeVideo(video);
+  }
+
+  async function analyzeUrl() {
+    const parsed = parseVideoUrl(url);
+    if (!parsed || !parsed.videoId) {
+      setError("无法识别视频链接或未提取到视频 ID");
+      return;
+    }
+    if (parsed.platform === "facebook") {
+      setError("暂不支持 Facebook 平台的数据抓取与业务分析。");
+      return;
+    }
+    if (config && !platformConfigured(config, parsed.platform)) {
+      setError("未配置 TiKhub 令牌，请先在设置页填写 TIKHUB_API_TOKEN");
+      return;
+    }
+    const fromDb = videos.find(
+      (v) => normalizeUrl(v.url) === normalizeUrl(url),
+    );
+    await analyzeVideo(fromDb ?? emptyVideo(parsed.platform, url), url);
+  }
+
+  async function analyzeVideo(video: SocialVideo, sourceUrl?: string) {
+    pipe.enqueue("高转化视频分析", async (runId, signal) => {
+      setBusy(true);
+      setError("");
+      setResult(null);
+      setInfo(video);
       try {
-        for (const v of videos) {
-          if (signal.aborted) return;
-          try {
-            const detail = await window.api.fetchVideoDetail({ platform: v.platform, videoId: v.id, runId });
-            if (signal.aborted) return;
-            const mediaUrl = detail.mediaUrl || v.mediaUrl;
-            const comments = (detail.comments || []).slice(0, 12).map((c) => c.text);
-            const r = await window.api.runAiTask({
-              task: 'analyzeConversionVideo',
-              payload: { desc: v.caption, comments, url: mediaUrl },
-              runId,
-            });
-            if (signal.aborted) return;
-            const er = v.views > 0 ? Math.round(((v.likes + v.comments + v.shares) / v.views) * 10000) / 100 : 0;
-            results.push({
-              videoId: v.id,
-              title: v.title || v.caption,
-              platform: v.platform,
-              engagementRate: er,
-              productImplantMethod: r?.productImplantMethod ?? '无植入',
-              potentialConversionLevel: (['高', '中', '低'].includes(r?.potentialConversionLevel) ? r.potentialConversionLevel : '中') as '高' | '中' | '低',
-              userConsultDemands: Array.isArray(r?.userConsultDemands) ? r.userConsultDemands : [],
-              summary: r?.summary ?? '',
-              score: (LEVEL_SCORE[r?.potentialConversionLevel] ?? 60) + Math.min(15, Math.round(er)),
-            });
-          } catch (e: any) {
-            // 单条失败不影响其余，但仍记录其处理流程（已通过 progress 事件推送到前端）
-            if (signal.aborted) return;
-            setError((prev) => prev ? `${prev}\n部分视频分析失败：${e?.message ?? e}` : `部分视频分析失败：${e?.message ?? e}`);
-          }
-        }
+        const detail = await window.api.fetchVideoDetail({
+          platform: video.platform,
+          videoId: video.id,
+          url: sourceUrl,
+          runId,
+        });
         if (signal.aborted) return;
-        results.sort((a, b) => b.score - a.score);
-        setRows(results);
-        // 持久化本次分析结果，下次打开直接展示
-        window.api.setJson('conversion', { rows: results }).catch(() => {});
+        const detailVideo = detail.video;
+        const merged: SocialVideo = detailVideo
+          ? { ...video, ...detailVideo, url: video.url || detailVideo.url }
+          : video;
+        setInfo(merged);
+        const mediaUrl = detail.mediaUrl || merged.mediaUrl;
+        const comments = (detail.comments || [])
+          .slice(0, 50)
+          .map((c) => c.text);
+        const ai = await window.api.runAiTask({
+          task: "analyzeConversionVideo",
+          payload: {
+            desc: merged.caption || merged.title,
+            title: merged.title,
+            tags: merged.tags,
+            comments,
+            url: mediaUrl,
+          },
+          runId,
+        });
+        if (signal.aborted) return;
+        setResult({
+          productImplantMethod: ai?.productImplantMethod || "无植入",
+          conversionPath: ai?.conversionPath || "未体现完整转化路径",
+          potentialConversionLevel: ["高", "中", "低"].includes(
+            ai?.potentialConversionLevel,
+          )
+            ? ai.potentialConversionLevel
+            : "中",
+          userConsultDemands: Array.isArray(ai?.userConsultDemands)
+            ? ai.userConsultDemands
+            : [],
+          summary: ai?.summary || "",
+        });
+      } catch (e: any) {
+        if (signal.aborted) return;
+        setError(e?.message ?? String(e));
+        throw e;
       } finally {
         setBusy(false);
       }
     });
   }
 
-  const highCount = rows.filter((r) => r.potentialConversionLevel === '高').length;
+  const selected = videos.find((v) => v.id === selectedId);
+  const levelClass =
+    result?.potentialConversionLevel === "高"
+      ? "badge-conv"
+      : result?.potentialConversionLevel === "低"
+        ? "badge-info"
+        : "badge-warn";
 
   return (
     <div className="page">
-      <h1>五、高转化视频分析（重点）</h1>
-      <p className="muted">针对旅行社 / 定制游转化型账号视频，调用 MiniMax-M3 多模态识别产品植入方式、判断潜在咨询转化强度，挖掘高转化内容规律。</p>
-
-      {loading ? <Spinner /> : videos.length === 0 ? (
-        <Empty text="暂无视频数据，请先在「二、视频数据库」抓取竞对视频" />
-      ) : (
-        <>
-          <div className="stat-row">
-            <Card><div className="stat"><div className="stat-value">{videos.length}</div><div className="stat-label">分析视频</div></div></Card>
-            <Card><div className="stat"><div className="stat-value">{highCount}</div><div className="stat-label">高转化潜力</div></div></Card>
-            <Card><div className="stat"><div className="stat-value">{rows[0]?.score ?? 0}</div><div className="stat-label">最高转化潜力</div></div></Card>
-          </div>
-
-          <Card title="AI 转化分析">
-            <button className="primary" onClick={analyze} disabled={busy || rows.length > 0}>
-              {busy ? '分析中（逐条调用 MiniMax-M3）…' : rows.length ? '重新分析' : '开始分析'}
+      <h1>六、高转化视频分析</h1>
+      <p className="muted">
+        选择视频库中的单条作品，或粘贴视频链接。系统结合作品内容、文案和真实评论，分析产品植入方式与用户转化路径。
+      </p>
+      <Card title="使用视频链接分析">
+        <div className="row">
+          <input
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            placeholder="粘贴 TikTok / Instagram / YouTube / 小红书视频链接"
+            style={{ flex: 1 }}
+          />
+          <button
+            className="primary"
+            onClick={analyzeUrl}
+            disabled={busy || !url.trim()}
+          >
+            开始分析
+          </button>
+        </div>
+      </Card>
+      <Card title="从视频库选择">
+        {loading ? (
+          <Spinner />
+        ) : videos.length === 0 ? (
+          <Empty text="暂无视频数据，请先在视频数据库抓取视频" />
+        ) : (
+          <>
+            <select
+              value={selectedId}
+              onChange={(e) => {
+                setSelectedId(e.target.value);
+                setResult(null);
+                setInfo(null);
+              }}
+              style={{ width: "100%" }}
+            >
+              {videos.map((v) => (
+                <option key={v.id} value={v.id}>
+                  {platformLabel(v.platform)} ·{" "}
+                  {(v.title.slice(0, 36) || v.id) +
+                    "（" +
+                    (v.viewsKnown === false ||
+                    (v.platform === "wechat_channels" && v.views === 0)
+                      ? "-"
+                      : v.views.toLocaleString()) +
+                    " 播放）"}
+                </option>
+              ))}
+            </select>
+            <button
+              className="primary"
+              style={{ marginTop: 10 }}
+              onClick={() => selected && analyzeLibraryVideo(selected)}
+              disabled={busy || !selected}
+            >
+              {busy ? "分析中…" : "分析选中视频"}
             </button>
-            {error && <p className="err" style={{ marginTop: 8 }}>{error}</p>}
-            {rows.length === 0 && !busy && (
-              <p className="muted" style={{ marginTop: 8 }}>点击上方按钮，对视频库全部视频逐条做转化潜力分析。</p>
-            )}
-          </Card>
-
-          {rows.length > 0 && (
-            <Card title="转化潜力排行（按评分）">
-              <div className="table-wrap">
-                <table className="tbl">
-                  <thead><tr><th>视频</th><th>平台</th><th>互动率</th><th>产品植入方式</th><th>转化强度</th><th>用户咨询诉求</th><th>评分</th></tr></thead>
-                  <tbody>
-                    {rows.slice(0, 20).map((r) => (
-                      <tr key={r.videoId}>
-                        <td className="small">{r.title}</td>
-                        <td>{platformLabel(r.platform)}</td>
-                        <td>{r.engagementRate}%</td>
-                        <td>{r.productImplantMethod === '无植入' ? <Badge>无植入</Badge> : <Badge kind="conv">{r.productImplantMethod}</Badge>}</td>
-                        <td>
-                          {r.potentialConversionLevel === '高' ? <Badge kind="conv">高</Badge> : r.potentialConversionLevel === '中' ? <Badge kind="warn">中</Badge> : <Badge kind="info">低</Badge>}
-                        </td>
-                        <td className="small muted">{(r.userConsultDemands || []).slice(0, 3).join('；') || '—'}</td>
-                        <td><b>{r.score}</b></td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+          </>
+        )}
+      </Card>
+      {error && <p className="err">{error}</p>}
+      {busy && (
+        <Card title="处理中">
+          <Spinner />
+        </Card>
+      )}
+      {info && result && (
+        <>
+          <Card title="视频基础信息">
+            <div className="info-grid">
+              <div className="info-item">
+                <span className="info-label">标题</span>
+                <span className="info-value">{info.title || "—"}</span>
               </div>
+              <div className="info-item">
+                <span className="info-label">平台</span>
+                <span className="info-value">
+                  {platformLabel(info.platform)}
+                </span>
+              </div>
+              <div className="info-item">
+                <span className="info-label">发布时间</span>
+                <span className="info-value">
+                  {formatDateTime(info.publishTime)}
+                </span>
+              </div>
+              <div className="info-item">
+                <span className="info-label">播放量</span>
+                <span className="info-value">
+                  {info.viewsKnown === false ||
+                  (info.platform === "wechat_channels" && info.views === 0)
+                    ? "-"
+                    : info.views.toLocaleString()}
+                </span>
+              </div>
+              <div className="info-item">
+                <span className="info-label">评论数</span>
+                <span className="info-value">
+                  {info.comments.toLocaleString()}
+                </span>
+              </div>
+            </div>
+          </Card>
+          <div className="grid-2">
+            <Card title="产品植入方式">
+              <StructuredText text={result.productImplantMethod} />
             </Card>
-          )}
-
-          {rows.length > 0 && (
-            <Card title="转化核心结论">
-              <ul className="kv">
-                <li><b>高转化视频（{highCount} 条）</b>普遍采用 <b>{[...new Set(rows.filter((r) => r.potentialConversionLevel === '高').map((r) => r.productImplantMethod))].join(' / ') || '—'}</b> 作为承接入口。</li>
-                <li>产品植入方式多样：{ [...new Set(rows.map((r) => r.productImplantMethod))].join('、') || '—'}。</li>
-                <li>建议：把高转化视频的 Hook 与结构沉淀为模板，批量复用于新内容。</li>
-              </ul>
+            <Card title="用户转化路径">
+              <StructuredText text={result.conversionPath} />
             </Card>
-          )}
+            <Card title="转化潜力">
+              <span className={levelClass}>
+                {result.potentialConversionLevel}
+              </span>
+              <StructuredText text={result.summary} />
+            </Card>
+            <Card title="用户咨询诉求">
+              {result.userConsultDemands.length ? (
+                <ul className="kv">
+                  {result.userConsultDemands.map((x, i) => (
+                    <li key={i}>{x}</li>
+                  ))}
+                </ul>
+              ) : (
+                <span className="muted">评论中未识别到明确咨询诉求</span>
+              )}
+            </Card>
+          </div>
         </>
       )}
-
     </div>
   );
 }

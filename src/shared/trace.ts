@@ -6,7 +6,15 @@
 //   - 渲染进程统一用 `import type` 仅引入类型，避免把主进程的单例收集器打进渲染包。
 //   - `trace` 单例只在主进程内运行，由 IPC handler 在返回结果上挂 `trace` 字段带回前端。
 
-export type TraceKind = 'tikhub' | 'minimax';
+export type TraceKind =
+  | "tikhub"
+  | "minimax"
+  | "image"
+  | "cache"
+  | "ytdlp"
+  | "ffmpeg"
+  | "whisper"
+  | "text";
 
 export interface TraceStep {
   kind: TraceKind;
@@ -14,7 +22,7 @@ export interface TraceStep {
   title: string;
   /** 完整请求地址（不含鉴权令牌） */
   endpoint?: string;
-  method?: 'GET' | 'POST';
+  method?: "GET" | "POST";
   /** 请求参数（已脱敏：不含令牌，仅 query / body 摘要） */
   params?: Record<string, unknown>;
   /** minimax 步骤：模型名 */

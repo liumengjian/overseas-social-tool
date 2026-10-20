@@ -22,16 +22,21 @@ const TRENDING_ENDPOINTS = [
 export class TikTokProvider implements SocialProvider {
   platform: Platform = 'tiktok';
   private client: TikHubClient;
+  // 同一轮账号分析会先 fetchAccount 再 fetchVideos；缓存身份解析结果，避免重复调用资料接口。
+  private identityCache = new Map<string, { identity: { uniqueId?: string; secUid?: string }; profile?: any }>();
 
   constructor(cfg: AppConfig) {
     this.client = new TikHubClient(cfg);
   }
+
 
   /** 解析账号链接，必要时先调 profile 拿到真正的 sec_user_id（部分视频接口需要它） */
   private async resolveIdentity(accountUrl: string): Promise<{ uniqueId?: string; secUid?: string }> {
     const { uniqueId, secUid } = parseAccountUrl('tiktok', accountUrl);
     if (secUid) return { uniqueId, secUid };
     if (!uniqueId) return { uniqueId, secUid };
+    const cached = this.identityCache.get(uniqueId.toLowerCase());
+    if (cached) return cached.identity;
     // 仅拿到 @username：先拉 profile 取 sec_uid（视频接口需要它）
     // App V3 优先（最稳定），Web 回退；两者参数均为 unique_id / sec_uid
     for (const ep of [
@@ -44,7 +49,11 @@ export class TikTokProvider implements SocialProvider {
         const user = pick(data, 'user', 'author', 'userInfo') ?? data ?? {};
         const s = pick(user, 'sec_uid', 'secUid');
         const u = pick(user, 'unique_id', 'uniqueId');
-        if (s || u) return { uniqueId: u ?? uniqueId, secUid: s ?? undefined };
+        if (s || u) {
+          const identity = { uniqueId: u ?? uniqueId, secUid: s ?? undefined };
+          this.identityCache.set(uniqueId.toLowerCase(), { identity, profile: data });
+          return identity;
+        }
       } catch {
         // 尝试下一个端点
       }
@@ -58,14 +67,18 @@ export class TikTokProvider implements SocialProvider {
     if (secUid) params.sec_user_id = secUid;
     if (uniqueId) params.unique_id = uniqueId;
     // App V3 优先，Web 回退
-    let resp: any = null;
+    let resp: any = this.identityCache.get((uniqueId ?? '').toLowerCase())?.profile ?? null;
     let lastErr: unknown;
-    for (const ep of [
+    for (const ep of resp ? [] : [
       '/api/v1/tiktok/app/v3/handler_user_profile',
       '/api/v1/tiktok/web/fetch_user_profile',
     ]) {
       try {
         resp = await this.client.get(ep, params);
+        const data = resp?.data ?? resp;
+        const resolvedUser = pick(data, 'user', 'author', 'userInfo') ?? data ?? {};
+        const resolvedUniqueId = pick(resolvedUser, 'unique_id', 'uniqueId') ?? uniqueId;
+        this.identityCache.set(String(resolvedUniqueId).toLowerCase(), { identity: { uniqueId: resolvedUniqueId, secUid }, profile: data });
         break;
       } catch (e) {
         lastErr = e;
@@ -141,90 +154,34 @@ export class TikTokProvider implements SocialProvider {
       .slice(0, limit);
   }
 
-  // 模块三：热点追踪预设的中国旅游相关关键词（fetch_general_search_result 搜索源）
-  private static readonly TREND_KEYWORDS = [
-    'china travel', 'china tourism', 'visit china', 'china food', 'chinese culture',
-    '张家界', '西安', '成都', 'china trip', 'travel china 2026',
-  ];
-
   /** 模块三：基于 TikTok 真实「热门搜索词」接口的热点话题（替代旧的 trending_post / 关键词搜索聚合方案） */
-  async fetchTrends(_accounts?: string[]): Promise<TrendTopic[]> {
+  async fetchTrends(_keyword?: string): Promise<TrendTopic[]> {
     try {
       const resp: any = await this.client.get('/api/v1/tiktok/web/fetch_trending_searchwords', {});
       const words: any[] = resp?.data?.trending_search_words ?? [];
+      // 热点页初始加载不能退化为遍历预设关键词搜索；关键词搜索只由用户输入后触发。
       if (!words.length) return [];
-      // 按排名映射热度（排名越靠前越热），并标注热门类型（trendingSearchWordType==='2' 视为「上升/爆款」）
-      return words.slice(0, 30).map((w: any, idx: number) => {
-        const kw = String(w?.trendingSearchWord ?? '').trim();
-        return {
-          platform: 'tiktok' as Platform,
-          keyword: kw,
-          heat: Math.max(1, 100 - idx),
-          growth: 0, // 增长率由 DataService 基于多时段快照计算（同平台前后对比）
-          relatedTags: w?.trendingSearchWordType === '2' ? ['#trending'] : [],
-        };
-      });
-    } catch {
-      // 接口不可用（如 402 额度不足）时回退到关键词搜索聚合
-      return this.fetchTrendsFromSearch();
-    }
-  }
-
-  /** 兜底：当真实 trending 接口不可用时，用关键词搜索聚合出热点（仅 TikTok 自身关键词） */
-  private async fetchTrendsFromSearch(): Promise<TrendTopic[]> {
-    const out: TrendTopic[] = [];
-    for (const kw of TikTokProvider.TREND_KEYWORDS) {
-      try {
-        const videos = await this.searchVideos(kw);
-        if (!videos.length) continue;
-        const totalViews = videos.reduce((s, v) => s + v.views, 0);
-        const heat = Math.min(100, 30 + Math.round(totalViews / videos.length / 50000));
-        const tagSet = new Set<string>();
-        videos.forEach((v) => v.tags.slice(0, 3).forEach((t) => tagSet.add(t)));
-        out.push({
-          platform: 'tiktok' as Platform,
-          keyword: kw,
-          heat,
-          growth: 0,
-          relatedTags: Array.from(tagSet).slice(0, 5).map((t) => `#${t}`),
-        });
-      } catch {
-        // 单个关键词失败不中断
-      }
-    }
-    return out.sort((a, b) => b.heat - a.heat).slice(0, 20);
-  }
-
-  async fetchHashtags(_accounts?: string[]): Promise<HashtagStat[]> {
-    const map = new Map<string, { posts: number; views: number }>();
-    const bump = (name: string, views: number) => {
-      if (!name) return;
-      const key = name.replace(/^#/, '');
-      const cur = map.get(key) ?? { posts: 0, views: 0 };
-      cur.posts += 1;
-      cur.views += views;
-      map.set(key, cur);
-    };
-    for (const kw of TikTokProvider.TREND_KEYWORDS) {
-      try {
-        const videos = await this.searchVideos(kw);
-        for (const v of videos) {
-          v.tags.forEach((t) => bump(t, v.views));
-        }
-      } catch {
-        // ignore
-      }
-    }
-    return Array.from(map.entries())
-      .map(([tag, st]) => ({
-        tag: `#${tag}`,
+      return words.slice(0, 30).map((w: any, idx: number) => ({
         platform: 'tiktok' as Platform,
-        posts: st.posts,
-        views: st.views,
+        keyword: String(w?.trendingSearchWord ?? w?.trending_search_word ?? '').trim(),
+        heat: Math.max(1, 100 - idx),
         growth: 0,
-      }))
-      .sort((a, b) => b.views - a.views || b.posts - a.posts)
-      .slice(0, 10);
+        relatedTags: w?.trendingSearchWordType === '2' ? ['#trending'] : [],
+      })).filter((item) => item.keyword);
+    } catch { return []; }
+  }
+
+  async fetchHashtags(keyword?: string): Promise<HashtagStat[]> {
+    const kw = keyword?.trim();
+    if (!kw) return [];
+    const resp: any = await this.client.get('/api/v1/tiktok/app/v3/fetch_hashtag_search_result', { keyword: kw });
+    return digTikTokHashtags(resp).map((item) => ({
+      tag: `#${item.name}`,
+      platform: 'tiktok' as Platform,
+      posts: item.posts,
+      views: item.views,
+      growth: 0,
+    })).slice(0, 30);
   }
 
   /** 模块二/四/五：单条视频详情（无水印直链 + 元数据） */
@@ -232,7 +189,10 @@ export class TikTokProvider implements SocialProvider {
     const awemeId = videoId.replace(/^tiktok_/, '');
     try {
       const r: any = await this.client.get('/api/v1/tiktok/app/v3/fetch_one_video', { aweme_id: awemeId });
-      const data = r?.data ?? r?.aweme_detail ?? r;
+      // TiKhub currently wraps the detail as data.aweme_detail. Older responses
+      // returned aweme_detail (or the detail object) directly, so retain all
+      // shapes for compatibility.
+      const data = r?.data?.aweme_detail ?? r?.aweme_detail ?? r?.data ?? r;
       if (!data || !data.aweme_id) return null;
       return normalizeTikTokVideo(data);
     } catch {
@@ -323,6 +283,36 @@ function pick(obj: any, ...keys: string[]): any {
     if (v !== undefined && v !== null) return v;
   }
   return undefined;
+}
+
+function digTikTokHashtags(resp: any): { name: string; posts: number; views: number }[] {
+  const root = resp?.data ?? resp;
+  // App V3 搜索接口返回 data.challenge_list，每项的真实字段在 challenge_info 内。
+  const list = findArrayByKeys(root, ['challenge_list', 'items', 'hashtags', 'hashtag_list', 'results', 'data']) ?? [];
+  return list.map((item: any) => {
+    const info = item?.challenge_info ?? item?.challengeInfo ?? item;
+    return {
+      name: String(pick(item, 'hashtag_name', 'hashtagName', 'name', 'title', 'keyword', 'tag_name')
+        ?? pick(info, 'cha_name', 'search_cha_name', 'hashtag_name', 'hashtagName', 'name') ?? '').replace(/^#/, '').trim(),
+      posts: Number(pick(item, 'video_count', 'post_count', 'aweme_count', 'videoCount', 'postCount')
+        ?? pick(info, 'use_count', 'user_count', 'video_count', 'post_count', 'aweme_count') ?? 0),
+      views: Number(pick(item, 'view_count', 'views', 'viewCount') ?? pick(info, 'view_count', 'views', 'viewCount') ?? 0),
+    };
+  }).filter((item: { name: string }) => item.name);
+}
+
+function findArrayByKeys(value: any, keys: string[], depth = 0): any[] | null {
+  if (!value || depth > 6) return null;
+  if (Array.isArray(value)) return value;
+  if (typeof value !== 'object') return null;
+  for (const key of keys) {
+    if (Array.isArray(value[key])) return value[key];
+  }
+  for (const child of Object.values(value)) {
+    const found = findArrayByKeys(child, keys, depth + 1);
+    if (found) return found;
+  }
+  return null;
 }
 
 /**
@@ -443,9 +433,9 @@ function normalizeTikTokVideo(v: any): SocialVideo {
     authorName: pick(author, 'nickname', 'unique_id', 'uniqueId', 'name') ?? 'unknown',
     url: `https://www.tiktok.com/@${pick(author, 'unique_id', 'uniqueId') ?? 'user'}/video/${aid}`,
     publishTime: createTime > 0 ? new Date(createTime * 1000).toISOString() : new Date().toISOString(),
-    title: desc.slice(0, 40),
+    title: desc,
     caption: desc,
-    hook: desc.slice(0, 60),
+    hook: '',
     views: num(pick(stats, 'play_count', 'playCount', 'views', 'plays')),
     likes: num(pick(stats, 'digg_count', 'diggCount', 'likes')),
     comments: num(pick(stats, 'comment_count', 'commentCount', 'comments')),

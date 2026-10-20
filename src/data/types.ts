@@ -1,5 +1,12 @@
 // 平台数据提供者统一接口
-import { HashtagStat, Platform, SocialAccount, SocialVideo, TrendTopic, VideoComment } from '../shared/types';
+import {
+  HashtagStat,
+  Platform,
+  SocialAccount,
+  SocialVideo,
+  TrendTopic,
+  VideoComment,
+} from "../shared/types";
 
 export interface SocialProvider {
   platform: Platform;
@@ -7,10 +14,12 @@ export interface SocialProvider {
   fetchAccount(accountUrl: string): Promise<SocialAccount>;
   /** 抓取账号下的视频/帖子列表 */
   fetchVideos(accountUrl: string, limit: number): Promise<SocialVideo[]>;
-  /** 抓取热点趋势（关键词/话题）。accounts 仅供 Instagram 使用：以指定参考账号的 Reels 聚合（TiKhub 无 IG 搜索/hashtag 接口） */
-  fetchTrends(accounts?: string[]): Promise<TrendTopic[]>;
-  /** 抓取/计算 Hashtag 排行。accounts 同上 */
-  fetchHashtags(accounts?: string[]): Promise<HashtagStat[]>;
+  /** 抓取热点趋势（关键词驱动：「搜索→提取→验证」三步即时发现；keyword 可为逗号分隔的多关键词） */
+  fetchTrends(keyword?: string): Promise<TrendTopic[]>;
+  /** 抓取/计算 Hashtag 排行。keyword 同上 */
+  fetchHashtags(keyword?: string): Promise<HashtagStat[]>;
+  /** 强制刷新前清理 provider 内部的短时聚合缓存。 */
+  clearTrendCache?(): void;
   /** 单条视频详情（无水印直链 + 元数据）：用于模块二/四/五的多模态解析 */
   fetchOneVideo(videoId: string): Promise<SocialVideo | null>;
   /** 单条视频评论（Top N）：用于模块四/五用户诉求分析 */

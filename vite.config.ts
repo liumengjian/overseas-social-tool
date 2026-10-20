@@ -11,7 +11,7 @@ import { resolve } from 'path';
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '');
   const tikhubConfigured = !!(env.TIKHUB_API_TOKEN && env.TIKHUB_API_TOKEN.trim());
-  const minimaxConfigured = !!(env.MINIMAX_API_KEY && env.MINIMAX_API_KEY.trim());
+  const videoConfigured = !!(env.VIDEO_API_KEY && env.VIDEO_API_KEY.trim());
 
   return {
     root: 'src/renderer',
@@ -19,14 +19,14 @@ export default defineConfig(({ mode }) => {
     base: './',
     define: {
       __TIKHUB_CONFIGURED__: JSON.stringify(tikhubConfigured),
-      __MINIMAX_CONFIGURED__: JSON.stringify(minimaxConfigured),
+      __VIDEO_CONFIGURED__: JSON.stringify(videoConfigured),
     },
     build: {
       outDir: resolve(__dirname, 'dist'),
       emptyOutDir: true,
     },
     server: {
-      port: 5173,
+      port: 5174,
       strictPort: true,
     },
   };

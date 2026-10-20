@@ -15,8 +15,11 @@
     "dist": "npm run build && electron-builder"
   },
   "dependencies": {
+    "cos-nodejs-sdk-v5": "^3.0.0",
     "dotenv": "^16.4.5",
+    "node-edge-tts": "^2.0.7",
     "ffmpeg-static": "^5.2.0",
+    "mysql2": "^3.24.2",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
@@ -41,7 +44,30 @@
       "dist/**/*"
     ],
     "extraResources": [
-      { "from": ".env", "to": ".env" }
+      {
+        "from": ".env",
+        "to": ".env"
+      },
+      {
+        "from": "resources/yt-dlp",
+        "to": "yt-dlp"
+      },
+      {
+        "from": "resources/whisper",
+        "to": "whisper"
+      },
+      {
+        "from": "resources/vc_redist.x64.exe",
+        "to": "vc_redist.x64.exe"
+      },
+      {
+        "from": "static/font",
+        "to": "static/font"
+      }
+    ],
+    "electronLanguages": [
+      "en-US",
+      "zh-CN"
     ],
     "win": {
       "target": "nsis"
@@ -49,7 +75,8 @@
     "nsis": {
       "oneClick": false,
       "perMachine": false,
-      "allowToChangeInstallationDirectory": true
+      "allowToChangeInstallationDirectory": true,
+      "include": "build/installer.nsh"
     }
   }
 }

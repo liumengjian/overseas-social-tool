@@ -18,11 +18,6 @@ export class YouTubeProvider implements SocialProvider {
     this.client = new TikHubClient(cfg);
   }
 
-  /** 模块三：中国旅游相关预设关键词（以搜索结果聚合热点与标签，替代不存在的 trending 接口） */
-  private static readonly TREND_KEYWORDS = [
-    'china travel', 'china tourism', 'visit china', 'china food', 'chinese culture',
-    '张家界', '西安旅游', '成都旅游', 'china trip', 'travel china 2026',
-  ];
 
   async fetchAccount(accountUrl: string): Promise<SocialAccount> {
     const channelId = extractChannelId(accountUrl);
@@ -72,69 +67,29 @@ export class YouTubeProvider implements SocialProvider {
         keyword,
         type: 'video',
       });
-      const items = resp?.data?.videos ?? resp?.videos ?? [];
+      const items = resp?.data?.videos ?? resp?.data?.items ?? resp?.videos ?? resp?.items ?? [];
       return (Array.isArray(items) ? items : []).slice(0, 20).map((v: any) => normalizeYtVideo(v));
     } catch {
       return [];
     }
   }
 
-  /** 模块三：基于关键词搜索聚合热点话题（替代不存在的 trending 接口） */
-  async fetchTrends(_accounts?: string[]): Promise<TrendTopic[]> {
-    const out: TrendTopic[] = [];
-    for (const kw of YouTubeProvider.TREND_KEYWORDS) {
-      try {
-        const videos = await this.searchVideos(kw);
-        if (!videos.length) continue;
-        const totalViews = videos.reduce((s, v) => s + v.views, 0);
-        const heat = Math.min(100, 30 + Math.round(totalViews / videos.length / 50000));
-        const tagSet = new Set<string>();
-        videos.forEach((v) => v.tags.slice(0, 3).forEach((t) => tagSet.add(t)));
-        out.push({
-          platform: 'youtube',
-          keyword: kw,
-          heat,
-          growth: 0, // 增长率由 DataService 基于多时段快照计算
-          relatedTags: Array.from(tagSet).slice(0, 5).map((t) => `#${t}`),
-        });
-      } catch {
-        // 单个关键词失败不中断
-      }
-    }
-    return out.sort((a, b) => b.heat - a.heat).slice(0, 20);
-  }
+  /** YouTube 暂无独立热点接口；热点词条仅在用户输入关键词后查询。 */
+  async fetchTrends(_keyword?: string): Promise<TrendTopic[]> { return []; }
 
   /** 模块三：从搜索结果标题/描述中抽取 #hashtag 聚合排行（YouTube 无原生 hashtag 接口） */
-  async fetchHashtags(_accounts?: string[]): Promise<HashtagStat[]> {
-    const map = new Map<string, { posts: number; views: number }>();
-    const bump = (name: string, views: number) => {
-      if (!name) return;
-      const key = name.replace(/^#/, '');
-      const cur = map.get(key) ?? { posts: 0, views: 0 };
-      cur.posts += 1;
-      cur.views += views;
-      map.set(key, cur);
-    };
-    for (const kw of YouTubeProvider.TREND_KEYWORDS) {
-      try {
-        const videos = await this.searchVideos(kw);
-        for (const v of videos) {
-          v.tags.forEach((t) => bump(t, v.views));
-        }
-      } catch {
-        // ignore
-      }
-    }
-    return Array.from(map.entries())
-      .map(([tag, st]) => ({
-        tag: `#${tag}`,
-        platform: 'youtube' as Platform,
-        posts: st.posts,
-        views: st.views,
-        growth: 0,
-      }))
-      .sort((a, b) => b.views - a.views || b.posts - a.posts)
-      .slice(0, 10);
+  async fetchHashtags(keyword?: string): Promise<HashtagStat[]> {
+    const kw = keyword?.trim();
+    if (!kw) return [];
+    const resp: any = await this.client.get('/api/v1/youtube/web_v2/get_search_suggestions', { keyword: kw });
+    return digYtSuggestions(resp).slice(0, 30).map((suggestion) => ({
+      tag: suggestion.text,
+      platform: 'youtube' as Platform,
+      posts: 0,
+      // 接口不返回单个建议词的浏览量时保持为 0，不用排序伪造热度。
+      views: suggestion.heat,
+      growth: 0,
+    }));
   }
 
   async fetchOneVideo(videoId: string): Promise<SocialVideo | null> {
@@ -187,6 +142,32 @@ function extractTags(text: string): string[] {
   return m ? m.map((t) => t.slice(1)) : [];
 }
 
+function digYtSuggestions(resp: any): { text: string; heat: number }[] {
+  const root = resp?.data ?? resp;
+  const list = findYtArray(root) ?? [];
+  if (!Array.isArray(list)) return [];
+  const seen = new Set<string>();
+  return list.map((item: any) => {
+    const text = String(typeof item === 'string' ? item : item?.keyword ?? item?.query ?? item?.text ?? item?.title ?? item?.suggestion ?? '').trim();
+    const heat = Number(item?.heat ?? item?.hot_score ?? item?.score ?? item?.view_count ?? item?.views ?? 0);
+    return { text, heat };
+  }).filter((item) => item.text && !seen.has(item.text) && (seen.add(item.text), true));
+}
+
+function findYtArray(value: any, depth = 0): any[] | null {
+  if (!value || depth > 6) return null;
+  if (Array.isArray(value)) return value;
+  if (typeof value !== 'object') return null;
+  for (const key of ['suggestions', 'items', 'results', 'data']) {
+    if (Array.isArray(value[key])) return value[key];
+  }
+  for (const child of Object.values(value)) {
+    const found = findYtArray(child, depth + 1);
+    if (found) return found;
+  }
+  return null;
+}
+
 function normalizeYtVideo(v: any): SocialVideo {
   const id = v?.video_id ?? v?.id ?? `yt_${Math.random()}`;
   const title: string = v?.title ?? '';
@@ -201,7 +182,7 @@ function normalizeYtVideo(v: any): SocialVideo {
     publishTime: new Date().toISOString(),
     title,
     caption: desc,
-    hook: title,
+    hook: '',
     views: parseCount(v?.view_count ?? v?.short_view_count),
     likes: parseCount(v?.like_count),
     comments: parseCount(v?.comment_count),

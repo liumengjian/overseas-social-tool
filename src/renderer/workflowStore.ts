@@ -7,11 +7,21 @@
 //   - 当某个工作流完成后，其展示仍保留在面板中（不清空），直到「下一个工作流开始执行」才被移除；
 //   - 在页面 A 的工作流进行中切换到页面 B 又发起工作流时，新工作流进入队列并展示其名称（排队中），
 //     等上一个执行完成后再自动开始执行（顺序执行，不并发）。
-import { useSyncExternalStore } from 'react';
-import type { AiChunkEvent, BatchProgressEvent, ProgressEvent, TraceStep } from '../shared/ipc';
-import type { PipelineState } from './hooks/usePipeline';
+import { useSyncExternalStore } from "react";
+import type {
+  AiChunkEvent,
+  BatchProgressEvent,
+  ProgressEvent,
+  TraceStep,
+} from "../shared/ipc";
+import type { PipelineState } from "./hooks/usePipeline";
 
-export type WorkflowStatus = 'queued' | 'running' | 'done' | 'error' | 'cancelled';
+export type WorkflowStatus =
+  | "queued"
+  | "running"
+  | "done"
+  | "error"
+  | "cancelled";
 
 export interface WorkflowItem {
   id: string;
@@ -37,17 +47,31 @@ export interface WorkflowState extends PipelineState {
   items: WorkflowItem[];
 }
 
-const genId = () => 'wf-' + Math.random().toString(36).slice(2) + '-' + Date.now().toString(36);
-const genRunId = () => 'run-' + Math.random().toString(36).slice(2) + '-' + Date.now().toString(36);
+const genId = () =>
+  "wf-" + Math.random().toString(36).slice(2) + "-" + Date.now().toString(36);
+const genRunId = () =>
+  "run-" + Math.random().toString(36).slice(2) + "-" + Date.now().toString(36);
 
 let items: WorkflowItem[] = [];
-let state: WorkflowState = { loading: false, steps: [], aiText: '', error: '', items };
+let state: WorkflowState = {
+  loading: false,
+  steps: [],
+  aiText: "",
+  error: "",
+  items,
+};
 let running = false;
 const listeners = new Set<() => void>();
 let subscribed = false;
 
 function emit() {
-  state = { loading: items[0]?.status === 'running', steps: items[0]?.steps ?? [], aiText: items[0]?.aiText ?? '', error: items[0]?.error ?? '', items };
+  state = {
+    loading: items[0]?.status === "running",
+    steps: items[0]?.steps ?? [],
+    aiText: items[0]?.aiText ?? "",
+    error: items[0]?.error ?? "",
+    items,
+  };
   listeners.forEach((l) => l());
 }
 
@@ -69,7 +93,9 @@ function onAiChunk(e: AiChunkEvent) {
 function onBatchProgress(e: BatchProgressEvent) {
   const it = items.find((i) => i.runId === e.runId);
   if (!it || it.cancelled) return;
-  updateItem(it.id, { progress: { current: e.current, total: e.total, label: e.label } });
+  updateItem(it.id, {
+    progress: { current: e.current, total: e.total, label: e.label },
+  });
 }
 
 function ensureSubscribed() {
@@ -96,10 +122,10 @@ export function enqueueWorkflow(opts: {
     runId: genRunId(),
     title: opts.title,
     module: opts.module,
-    status: 'queued',
+    status: "queued",
     steps: [],
-    aiText: '',
-    error: '',
+    aiText: "",
+    error: "",
     progress: undefined,
     cancelled: false,
     abort: new AbortController(),
@@ -120,12 +146,16 @@ export function cancelWorkflow(runId: string): void {
   const it = items.find((i) => i.runId === runId);
   if (!it || it.cancelled) return;
   it.cancelled = true;
-  if (it.status === 'running') {
+  if (it.status === "running") {
     // 正在执行：立即置为已取消（UI 即时反馈，不再等 IPC 返回）
-    it.status = 'cancelled';
+    it.status = "cancelled";
     it.abort?.abort();
     // 通知主进程中断在途请求（fetch abort，真正停止执行）
-    try { window.api.cancelRun(runId); } catch { /* 忽略 */ }
+    try {
+      window.api.cancelRun(runId);
+    } catch {
+      /* 忽略 */
+    }
     // 注意：不再移除其后的排队项——取消当前任务后，排队任务保留，3s 后自动开始
   } else {
     // 排队中：直接移除
@@ -148,10 +178,14 @@ async function pump() {
       const head = items[0];
       if (!head) break;
       // 队首是已完成/已取消项：若后面还有排队项，则在「下一个开始执行时」移除它（保持展示直到下一个运行）
-      if (head.status === 'done' || head.status === 'error' || head.status === 'cancelled') {
+      if (
+        head.status === "done" ||
+        head.status === "error" ||
+        head.status === "cancelled"
+      ) {
         if (items.length > 1) {
           // 被取消的任务：停留 3s 展示「已取消」，再开始执行排队的任务（给用户看清取消结果的时间）
-          if (head.status === 'cancelled') await delay(3000);
+          if (head.status === "cancelled") await delay(3000);
           items = items.slice(1);
           emit();
           continue;
@@ -164,16 +198,40 @@ async function pump() {
         emit();
         continue;
       }
-      if (head.status === 'queued') {
-        updateItem(head.id, { status: 'running' });
+      if (head.status === "queued") {
+        updateItem(head.id, { status: "running" });
       }
       const cur = items.find((i) => i.id === head.id);
       if (!cur) break;
+      // 取消看门狗：任务被取消后，若底层请求未感知取消导致 run 迟迟不退出，
+      // 5s 后强制跳过，避免队列被卡死（后续任务永远排队中）。
+      const watchdog = new Promise<void>((resolve) => {
+        const sig = cur.abort?.signal;
+        if (cur.cancelled) {
+          setTimeout(resolve, 5000);
+          return;
+        }
+        if (!sig) return;
+        sig.addEventListener("abort", () => setTimeout(resolve, 5000), {
+          once: true,
+        });
+      });
       try {
-        await cur.run(cur.runId, cur.abort?.signal ?? new AbortController().signal);
-        updateItem(cur.id, cur.cancelled ? { status: 'cancelled' } : { status: 'done' });
+        await Promise.race([
+          cur.run(cur.runId, cur.abort?.signal ?? new AbortController().signal),
+          watchdog,
+        ]);
+        updateItem(
+          cur.id,
+          cur.cancelled ? { status: "cancelled" } : { status: "done" },
+        );
       } catch (e: any) {
-        updateItem(cur.id, cur.cancelled ? { status: 'cancelled' } : { status: 'error', error: e?.message ?? String(e) });
+        updateItem(
+          cur.id,
+          cur.cancelled
+            ? { status: "cancelled" }
+            : { status: "error", error: e?.message ?? String(e) },
+        );
       }
       // 循环继续：若仍有排队项，下一轮会移除已完成的队首并开始下一个
     }
@@ -202,7 +260,9 @@ function getSnapshot(): WorkflowState {
  */
 export function useWorkflow(module?: string) {
   const s = useSyncExternalStore(subscribe, getSnapshot);
-  const enqueue = (title: string | undefined, run: (runId: string, signal: AbortSignal) => Promise<void>) =>
-    enqueueWorkflow({ title, module, run });
+  const enqueue = (
+    title: string | undefined,
+    run: (runId: string, signal: AbortSignal) => Promise<void>,
+  ) => enqueueWorkflow({ title, module, run });
   return { state: s, enqueue, cancel: cancelWorkflow };
 }

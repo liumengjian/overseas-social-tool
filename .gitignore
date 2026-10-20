@@ -5,4 +5,9 @@ dist-electron
 release
 .env
 *.log
+!resources/yt-dlp/yt-dlp.exe
+!resources/whisper/
+!resources/whisper/**
+# Whisper model is downloaded locally; keep the large binary out of Git.
+resources/whisper/models/*.bin
 .DS_Store
