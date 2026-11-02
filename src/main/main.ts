@@ -43,10 +43,10 @@ import {
 import { renderPlans, extractAudio, synthesizeVoiceover, generateSpeechAudio } from "./ffmpeg";
 import { editImage, generateImage } from "./image-generation";
 import { uploadTemplateImage, uploadVideoToCos, uploadImageDataUrl } from "./cos-storage";
-import { analyzeVoiceover, generateSopReply } from "./customer-sop";
+import { analyzeVoiceover, generateSopReply, correctTranscript } from "./customer-sop";
 import { transcribeLocally } from "./whisper";
 import { EditMaterial, EditPlan } from "../analysis/ai-edit";
-import { AppConfig, SocialVideo } from "../shared/types";
+import { AppConfig, Platform, SocialVideo } from "../shared/types";
 import { IPC_CHANNELS, IpcApi } from "../shared/ipc";
 import { trace, Traced, setTraceSink } from "../shared/trace";
 import { closeWechatDecryptWindow, decryptWechatVideo } from "./wechat-decrypt";
@@ -143,6 +143,50 @@ async function downloadBufferWithBrowser(
     );
   }
   return Buffer.from(await res.arrayBuffer());
+}
+
+/** 源站风控/登录页会以 HTTP 200 返回 HTML 而非视频字节；识别后避免把网页当视频存盘交给 ffmpeg。 */
+function looksLikeHtmlPage(buf: Buffer): boolean {
+  const head = buf
+    .subarray(0, Math.min(buf.length, 1024))
+    .toString("latin1")
+    .trimStart();
+  return /^<!doctype html/i.test(head) || /^<html/i.test(head);
+}
+
+/** 纠错后按原分段字符占比重新分配文本，保持时间轴与 SRT 分段同步。 */
+function redistributeSegmentText(
+  segments: { start: number; end: number; text: string }[],
+  corrected: string,
+): { start: number; end: number; text: string }[] {
+  if (!segments?.length || !corrected) return segments;
+  const total = segments.reduce((s, x) => s + (x.text ?? "").length, 0);
+  if (!total) return segments;
+  const out: { start: number; end: number; text: string }[] = [];
+  let offset = 0;
+  segments.forEach((seg, i) => {
+    if (i === segments.length - 1) {
+      const len = Math.max(0, corrected.length - offset);
+      out.push({
+        start: seg.start,
+        end: seg.end,
+        text: corrected.slice(offset, offset + len) || seg.text,
+      });
+      return;
+    }
+    const share = (seg.text ?? "").length / total;
+    const len = Math.min(
+      Math.round(corrected.length * share),
+      corrected.length - offset,
+    );
+    out.push({
+      start: seg.start,
+      end: seg.end,
+      text: corrected.slice(offset, offset + len) || seg.text,
+    });
+    offset += len;
+  });
+  return out;
 }
 
 /** 返回随应用分发的 yt-dlp；开发态从项目 resources 读取，打包态从 extraResources 读取。 */
@@ -612,6 +656,8 @@ function registerIpc() {
         sourceUrl: string;
         pageUrl?: string;
         videoId?: string;
+        mediaUrls?: string[];
+        platform?: Platform;
         runId?: string;
       },
     ) =>
@@ -623,6 +669,45 @@ function registerIpc() {
         const audio = join(tmp, "audio.wav");
         try {
           let videoBytes: Buffer | undefined;
+          // 签名直链候选（yt-dlp 解析 / 视频库 TiKhub 直链，按序回退），用于 yt-dlp 不可用或页面被风控时
+          const pageUrl = args.pageUrl?.trim();
+          const directCandidates = Array.from(
+            new Set(
+              (args.mediaUrls ?? [])
+                .map((u) => (u ?? "").trim())
+                .filter((u): u is string => !!u && /^https?:\/\//.test(u)),
+            ),
+          );
+          // 尝试一条直链：下载成功且非 HTML（风控/验证页）才算数，失败记入 trace
+          const tryDirect = async (url: string): Promise<Buffer | undefined> => {
+            try {
+              const buf = await downloadBufferWithBrowser(url, signal);
+              if (!looksLikeHtmlPage(buf)) return buf;
+              trace.add({
+                kind: "tikhub",
+                title: "媒体直链返回网页（可能已过期或被风控）",
+                endpoint: url,
+                method: "GET",
+                status: 403,
+                ok: false,
+                durationMs: 0,
+                summary: "直链返回 HTML，尝试下一个候选",
+              });
+              return undefined;
+            } catch (e: any) {
+              trace.add({
+                kind: "tikhub",
+                title: "媒体直链下载失败",
+                endpoint: url,
+                method: "GET",
+                status: 403,
+                ok: false,
+                durationMs: 0,
+                error: e?.message ?? String(e),
+              });
+              return undefined;
+            }
+          };
           if (args.sourceUrl?.startsWith("localmedia://")) {
             const rel = decodeURIComponent(
               args.sourceUrl.slice("localmedia://".length),
@@ -635,7 +720,6 @@ function registerIpc() {
               throw new Error("本地视频文件不存在，请先重新下载视频");
             videoBytes = readFileSync(p);
           } else if (args.sourceUrl && /^https?:\/\//.test(args.sourceUrl)) {
-            const pageUrl = args.pageUrl?.trim();
             const bundled = bundledYtDlpPath();
             const ytdlpBin =
               bundled || dataService.config.ytdlpPath || "yt-dlp";
@@ -674,11 +758,57 @@ function registerIpc() {
                 });
               }
             }
-            if (!downloadedByYtDlp)
-              videoBytes = await downloadBufferWithBrowser(
-                args.sourceUrl,
-                signal,
-              );
+            // yt-dlp 不可用时按序回退签名直链（与爆款拆解同款链路：直链不走页面风控），
+            // 全部失败才直连页面 URL 兜底。
+            if (!downloadedByYtDlp) {
+              for (const direct of directCandidates) {
+                videoBytes = await tryDirect(direct);
+                if (videoBytes) {
+                  trace.add({
+                    kind: "tikhub",
+                    title: "已使用签名直链下载视频",
+                    endpoint: direct,
+                    method: "GET",
+                    status: 200,
+                    ok: true,
+                    durationMs: 0,
+                    summary: "yt-dlp 不可用时回退媒体直链",
+                  });
+                  break;
+                }
+              }
+              // 惰性兜底：页面与已给直链都不可用时，才向 TiKhub 取一条新直链
+              // （只调单条视频接口拿媒体地址，不拉详情字段与评论，避免无谓的接口消耗）
+              if (!videoBytes && args.platform && args.videoId) {
+                const fresh = await dataService.fetchVideoMediaUrl(
+                  args.platform,
+                  args.videoId,
+                  pageUrl,
+                );
+                if (fresh) {
+                  const buf = await tryDirect(fresh);
+                  if (buf) {
+                    videoBytes = buf;
+                    trace.add({
+                      kind: "tikhub",
+                      title: "已使用 TiKhub 新直链下载视频",
+                      endpoint: fresh,
+                      method: "GET",
+                      status: 200,
+                      ok: true,
+                      durationMs: 0,
+                      summary: "已有直链不可用，按需向 TiKhub 重新取直链",
+                    });
+                  }
+                }
+              }
+              // 最后兜底：直连页面 URL（可能返回验证页，交由下方 HTML 校验处理）
+              if (!videoBytes)
+                videoBytes = await downloadBufferWithBrowser(
+                  args.sourceUrl,
+                  signal,
+                );
+            }
           } else {
             throw new Error("没有可用的视频地址，请先下载视频或刷新视频库");
           }
@@ -688,6 +818,12 @@ function registerIpc() {
             );
           if (videoBytes.length < 1024)
             throw new Error("下载内容过小，可能不是有效视频");
+          // 源站风控/登录页会以 200 返回 HTML：识别后给出明确提示，
+          // 而不是把网页存成 input.mp4 让 ffmpeg 报 moov atom not found。
+          if (looksLikeHtmlPage(videoBytes))
+            throw new Error(
+              "下载视频失败：源站返回验证页、媒体直链也未能取回视频（TikTok 等平台的 CDN 常拒绝代理/数据中心 IP）。请更换住宅 IP 代理节点，或在视频库先把该视频下载到本地后再抓口播",
+            );
           writeFileSync(input, videoBytes);
           trace.add({
             kind: "tikhub",
@@ -733,6 +869,52 @@ function registerIpc() {
             durationMs: 0,
             summary: `已识别 ${transcript.text.length} 个字符`,
           });
+          // 抓取完成后调用一次轻量模型纠错（关闭思考、快速返回），修正错别字/转写错误；
+          // 失败时保留原转写，不阻塞主流程。纠错后的文本同时用于展示与后续分析。
+          let correctedText = transcript.text;
+          const correctStartedAt = Date.now();
+          trace.add({
+            kind: "text",
+            title: "正在纠错口播文案",
+            endpoint: `${dataService.config.sopBaseUrl}/chat/completions`,
+            method: "POST",
+            model: dataService.config.sopModel,
+            status: 102,
+            ok: true,
+            durationMs: 0,
+            summary: "轻量模型调用（关闭思考）修正错别字与转写错误",
+          });
+          try {
+            correctedText = await correctTranscript(
+              dataService.config,
+              transcript.text,
+              signal,
+            );
+            trace.add({
+              kind: "text",
+              title: "口播文案纠错完成",
+              endpoint: `${dataService.config.sopBaseUrl}/chat/completions`,
+              method: "POST",
+              model: dataService.config.sopModel,
+              status: 200,
+              ok: true,
+              durationMs: Date.now() - correctStartedAt,
+              summary: "已修正错别字，供展示与分析使用",
+            });
+          } catch (error: any) {
+            correctedText = transcript.text;
+            trace.add({
+              kind: "text",
+              title: "纠错失败，保留原转写",
+              endpoint: `${dataService.config.sopBaseUrl}/chat/completions`,
+              method: "POST",
+              model: dataService.config.sopModel,
+              status: 500,
+              ok: false,
+              durationMs: Date.now() - correctStartedAt,
+              error: error?.message ?? String(error),
+            });
+          }
           const analysisStartedAt = Date.now();
           trace.add({
             kind: "text",
@@ -743,13 +925,13 @@ function registerIpc() {
             status: 102,
             ok: true,
             durationMs: 0,
-            summary: "正在使用客服 SOP 文本模型分析完整口播文案",
+            summary: "正在使用文本模型分析完整口播文案",
           });
           let analysis;
           try {
             analysis = await analyzeVoiceover(
               dataService.config,
-              transcript.text,
+              correctedText,
               signal,
             );
             trace.add({
@@ -777,7 +959,17 @@ function registerIpc() {
             });
             throw error;
           }
-          return { transcript, analysis };
+          // 展示用转写 = 纠错后的完整文本 + 按原占比重分配的分段（时间轴不变）
+          return {
+            transcript: {
+              text: correctedText,
+              segments: redistributeSegmentText(
+                transcript.segments,
+                correctedText,
+              ),
+            },
+            analysis,
+          };
         } finally {
           rmSync(tmp, { recursive: true, force: true });
         }

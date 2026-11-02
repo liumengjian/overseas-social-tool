@@ -84,6 +84,7 @@ export default function VoiceoverCapture() {
     cacheUrl: string,
     enqueue = true,
     inherited?: { runId: string; signal: AbortSignal },
+    mediaUrls?: string[],
   ) {
     if (!sourceUrl) {
       setError("未获取到视频地址，请先在视频库下载视频或刷新视频直链");
@@ -118,6 +119,8 @@ export default function VoiceoverCapture() {
           sourceUrl,
           pageUrl: videoInfo.url,
           videoId: videoInfo.id,
+          mediaUrls,
+          platform: videoInfo.platform,
           runId,
         });
         if (signal.aborted) return;
@@ -151,7 +154,14 @@ export default function VoiceoverCapture() {
     }
     // 本地视频直接读取；远程视频交给主进程 yt-dlp 下载，避免提前解析出易过期的 CDN 直链。
     const source = v.localMediaUrl || v.url || v.mediaUrl;
-    await run(source || "", v, v.url || v.id);
+    await run(
+      source || "",
+      v,
+      v.url || v.id,
+      true,
+      undefined,
+      v.mediaUrl ? [v.mediaUrl] : undefined,
+    );
   }
 
   async function runUrl() {
@@ -191,7 +201,14 @@ export default function VoiceoverCapture() {
           isVideo: true,
           mediaType: "video",
         } as SocialVideo;
-        await run(url, v, url, false, { runId, signal });
+        // 与爆款拆解同款：先让 yt-dlp 解析签名直链；页面/直链均不可用时，
+        // 主进程会按需向 TiKhub 重新取一条媒体直链（只取媒体地址，不拉详情与评论）。
+        const mediaUrls: string[] = [];
+        const yt = await window.api.resolveMediaUrl({ url, runId });
+        if (signal.aborted) return;
+        if (yt.mediaUrl) mediaUrls.push(yt.mediaUrl);
+        if (mediaUrls[0]) v.mediaUrl = mediaUrls[0];
+        await run(url, v, url, false, { runId, signal }, mediaUrls);
       } catch (e: any) {
         setError(e?.message ?? String(e));
         setState("error");

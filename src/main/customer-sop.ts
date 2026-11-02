@@ -139,3 +139,60 @@ export async function analyzeVoiceover(
     throw new Error("客服 SOP 模型返回的分析结果不是有效 JSON");
   }
 }
+
+/** 口播转写纠错：单次轻量调用修正错别字/语音转写错误（关闭模型思考，快速返回）。 */
+export async function correctTranscript(
+  config: AppConfig,
+  transcript: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const text = transcript.trim();
+  if (!text) throw new Error("口播文案为空，无需纠错");
+  if (!config.sopApiKey.trim())
+    throw new Error("未配置客服 SOP 对话模型 API Key，请先在设置页配置");
+  const response = await net.fetch(
+    `${config.sopBaseUrl.trim().replace(/\/+$/, "")}/chat/completions`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${config.sopApiKey.trim()}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({
+        model: config.sopModel.trim() || "doubao-seed-2-0-lite-260215",
+        // 关闭模型思考：只做纠错、快速返回
+        thinking: { type: "disabled" },
+        temperature: 0,
+        max_tokens: 8000,
+        stream: false,
+        messages: [
+          {
+            role: "system",
+            content:
+              "你是口播视频语音转写校对员。只修正错别字、语音识别错误、标点与断句错误；保持原语言、原意、原内容，不增删、不改写、不翻译、不润色。直接输出修正后的完整文本，禁止输出任何解释、注释、标题或多余内容。",
+          },
+          { role: "user", content: text },
+        ],
+      }),
+      signal: signal
+        ? AbortSignal.any([signal, AbortSignal.timeout(60_000)])
+        : AbortSignal.timeout(60_000),
+    },
+  );
+  const raw = await response.text();
+  let body: any;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    body = null;
+  }
+  if (!response.ok)
+    throw new Error(
+      `纠错模型请求失败（HTTP ${response.status}）：${String(body?.error?.message || body?.message || raw).slice(0, 300)}`,
+    );
+  const content = body?.choices?.[0]?.message?.content;
+  if (typeof content !== "string" || !content.trim())
+    throw new Error("纠错模型返回为空");
+  return content.trim();
+}

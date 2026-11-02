@@ -339,6 +339,8 @@ export interface IpcApi {
     sourceUrl: string;
     pageUrl?: string;
     videoId?: string;
+    mediaUrls?: string[];
+    platform?: Platform;
     runId?: string;
   }) => Promise<{
     transcript: {

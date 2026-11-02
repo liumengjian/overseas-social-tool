@@ -93,6 +93,23 @@ export class DataService {
     return { video: base, mediaUrl: base?.mediaUrl, comments };
   }
 
+  /** 仅取单条视频的媒体直链（口播抓取兜底用）：不拉取详情字段与评论，避免无谓的接口消耗。 */
+  async fetchVideoMediaUrl(
+    platform: Platform,
+    videoId: string,
+    sourceUrl?: string,
+  ): Promise<string | undefined> {
+    if (!this.isPlatformConfigured(platform)) return undefined;
+    try {
+      const detailKey =
+        sourceUrl && platform === 'xiaohongshu' ? sourceUrl : videoId;
+      const video = await this.providers[platform].fetchOneVideo(detailKey);
+      return video?.mediaUrl || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   // ---- 趋势 + Hashtag 合并拉取（一次 IPC / 一个工作流）----
   async fetchTrendData(platform: Platform, keyword?: string, bypassCache = false): Promise<{ trends: TrendTopic[]; hashtags: HashtagStat[] }> {
     if (!this.isPlatformConfigured(platform)) return { trends: [], hashtags: [] };
