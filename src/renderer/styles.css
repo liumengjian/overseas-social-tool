@@ -2551,6 +2551,17 @@ code {
   margin: 0;
   padding: 0 24px;
   box-sizing: border-box;
+  /* 更早的记录由代码自己按锚点校正滚动位置，关掉浏览器自带的滚动锚定，避免双重补偿 */
+  overflow-anchor: none;
+}
+.ai-chat-earlier-hint {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 20px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
 }
 .ai-chat-turn {
   display: grid;

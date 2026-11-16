@@ -1,7 +1,14 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, {
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { Spinner } from "../components/ui";
 import ImageViewer from "../components/ImageViewer";
 import type { AppConfig } from "../../shared/types";
+import { IMAGE_MAX_EDGE, clampImageSize } from "../../shared/image-size";
 import type {
   GeneratedImage,
   ImageTemplate,
@@ -15,6 +22,8 @@ type ChatImage = GeneratedImage & {
   references?: TemplateImage[];
   pending?: boolean;
   error?: string;
+  // 聊天区展示用缩略图；原图不在内存里（复制 / 下载 / 局部修改时按 id 回磁盘取）
+  thumb?: string;
 };
 type TemplateImage = { name: string; dataUrl: string };
 type Selection = { x: number; y: number; width: number; height: number };
@@ -36,7 +45,15 @@ type TemplateUpdateInput = {
   imageFileName?: string;
   aspectRatio?: string;
 };
-const IMAGE_HISTORY_STORAGE_KEY = "ai_image_chat_history";
+// 聊天记录一次只取最近 10 条，向上滚动再按 10 条继续取更早的记录。
+const IMAGE_HISTORY_PAGE_SIZE = 10;
+// 距离顶部不足该距离时视为“已经滑到顶”，触发加载下一页历史。
+const CHAT_LOAD_EARLIER_THRESHOLD = 80;
+// 距离底部在这之内视为“仍停在最新消息处”，内容变高时继续贴住底部。
+const CHAT_STICK_BOTTOM_SLACK = 80;
+// 连续生成而不刷新页面时，内存里最多保留最近 20 条；更早的从内存丢掉，
+// 它们仍在磁盘上，会重新变成「上滑可取」的历史。
+const MAX_CHAT_TURNS = 20;
 const IMAGE_PROMPT_POLISH_SYSTEM =
   "你是 AI 图片生成提示词专家。理解用户输入后，完成润色和扩写，输出可直接交给图片生成模型的完整提示词。必须保留用户明确指定的主体、文字内容、语言、风格、构图、比例、颜色和限制，不能擅自改变需求。根据用户意图动态组织内容，不要套用固定模板：需要海报/营销物料时，补全合理的画面分区、文案层级和排版要求；需要人物、产品、场景、插画或摄影作品时，补全主体特征、环境、构图、镜头/视角、光影、色彩、材质和关键细节。只有用户要求或明显需要画面文字时，才补充文字区块；文字按所需语言给出，若有中英文需求则分别标明中文和 English。不要虚构品牌、价格、地点、人物或文字内容。使用清晰的 Markdown 分区和标签输出，方便图片模型理解；只输出扩写后的生图提示词，不要解释润色过程。";
 const TEMPLATE_LOCK_RULES = [
@@ -52,9 +69,26 @@ const TEMPLATE_LOCK_RULES = [
   "需要修改的模块列表：以下用户明确提出的修改内容。未明确列出的模块全部保持不变。",
 ].join("\n");
 
+// 原图（复制、下载、查看大图、局部修改必须用它，不能给缩略图）。
 function imageSrc(image: GeneratedImage): string {
   if (image.url) return image.url;
   return `data:${image.contentType || "image/png"};base64,${image.b64 || ""}`;
+}
+
+// 聊天区展示用：优先缩略图，其次远程 URL，最后才是内存里的原图。
+function displaySrc(image: GeneratedImage & { thumb?: string }): string {
+  return image.thumb || imageSrc(image);
+}
+
+// 按需取原图：内存里只剩缩略图时，回磁盘读这条记录的完整数据。
+async function originalSrc(image: ChatImage): Promise<string> {
+  if (image.url) return image.url;
+  if (image.b64) return imageSrc(image);
+  const turn = await window.api.getImageHistoryTurn({ id: image.id });
+  if (turn?.url) return turn.url;
+  if (turn?.b64)
+    return `data:${turn.contentType || "image/png"};base64,${turn.b64}`;
+  throw new Error("原图读取失败：磁盘上找不到这条记录");
 }
 
 function toImageInput(image: GeneratedImage) {
@@ -160,9 +194,35 @@ function isChatImage(value: unknown): value is ChatImage {
     typeof image.prompt === "string" &&
     (typeof image.url === "string" ||
       typeof image.b64 === "string" ||
+      // 历史记录只回传缩略图（原图留在磁盘），这类记录同样要能展示。
+      typeof image.thumb === "string" ||
       image.pending === true ||
       typeof image.error === "string")
   );
+}
+
+function findChatTurn(scroll: HTMLElement, id: string): HTMLElement | null {
+  const turns = scroll.querySelectorAll<HTMLElement>("[data-turn-id]");
+  for (const turn of turns) if (turn.dataset.turnId === id) return turn;
+  return null;
+}
+
+function chatTurnTop(scroll: HTMLElement, id: string): number | null {
+  const turn = findChatTurn(scroll, id);
+  if (!turn) return null;
+  return turn.getBoundingClientRect().top - scroll.getBoundingClientRect().top;
+}
+
+// 更早的记录插到列表顶部后，以一条既有消息为锚点把滚动位置修正回来，
+// 保证用户正在看的消息停在原处；图片异步解码后高度继续变化时同样适用。
+function keepChatScrollAnchor(
+  scroll: HTMLElement,
+  anchor: { id: string; top: number },
+): void {
+  const current = chatTurnTop(scroll, anchor.id);
+  if (current === null) return;
+  const delta = current - anchor.top;
+  if (Math.abs(delta) > 0.5) scroll.scrollTop += delta;
 }
 
 function readFile(file: File): Promise<string> {
@@ -225,7 +285,12 @@ export default function AiImage({ active = true }: { active?: boolean }) {
   const [selectedTemplate, setSelectedTemplate] =
     useState<ImageTemplate | null>(null);
   const [images, setImages] = useState<ChatImage[]>([]);
+  // 历史记录改成「索引 + 每条一个文件」的分片存储：只把当前已加载的条数放在状态里。
+  // historyTotal = 存储中的总条数；historyOffset = 已经从存储取出的条数（距末尾的偏移）。
+  const [historyTotal, setHistoryTotal] = useState(0);
+  const [historyOffset, setHistoryOffset] = useState(0);
   const [historyLoading, setHistoryLoading] = useState(true);
+  const [earlierLoading, setEarlierLoading] = useState(false);
   const [viewerSrc, setViewerSrc] = useState<{
     src: string;
     alt?: string;
@@ -244,7 +309,118 @@ export default function AiImage({ active = true }: { active?: boolean }) {
   const [dragActive, setDragActive] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const chatRef = useRef<HTMLDivElement>(null);
+  const messagesRef = useRef<HTMLDivElement>(null);
+  // 懒加载更早记录时用于固定阅读位置的锚点；为空表示不做位置修正。
+  const prependAnchorRef = useRef<{ id: string; top: number } | null>(null);
+  // 打开页面停留在最新消息处；图片陆续解码时继续贴住底部，不往上跑。
+  const stickToBottomRef = useRef(true);
+  const loadingEarlierRef = useRef(false);
   const pipe = useWorkflow("AI生图");
+
+  // 已加载记录在整份历史中的起始序号（用于下载文件名等）
+  const visibleStart = Math.max(historyTotal - historyOffset, 0);
+  const hasEarlierImages = visibleStart > 0;
+  // 异步取页时回调里要读最新偏移，用 ref 转发。
+  const historyOffsetRef = useRef(0);
+  historyOffsetRef.current = historyOffset;
+
+  function beginLoadEarlier(scroll: HTMLDivElement) {
+    if (loadingEarlierRef.current || !hasEarlierImages) return;
+    const anchorId = images[0]?.id;
+    const anchorTop = anchorId ? chatTurnTop(scroll, anchorId) : null;
+    prependAnchorRef.current =
+      anchorId && anchorTop !== null ? { id: anchorId, top: anchorTop } : null;
+    loadingEarlierRef.current = true;
+    setEarlierLoading(true);
+    void window.api
+      .getImageHistoryPage({
+        offset: historyOffsetRef.current,
+        limit: IMAGE_HISTORY_PAGE_SIZE,
+      })
+      .then((page) => {
+        setHistoryTotal(page.total);
+        setHistoryOffset(page.nextOffset);
+        if (page.turns.length) {
+          setImages((previous) => {
+            const known = new Set(previous.map((item) => item.id));
+            const prepended = page.turns
+              .filter(isChatImage)
+              .filter((turn) => !known.has(turn.id));
+            return prepended.length ? [...prepended, ...previous] : previous;
+          });
+          return;
+        }
+        // 存储里已经没有更早的记录（或对应文件缺失）：结束提示，避免一直显示可加载。
+        loadingEarlierRef.current = false;
+        setEarlierLoading(false);
+      })
+      .catch((cause: unknown) => {
+        loadingEarlierRef.current = false;
+        setEarlierLoading(false);
+        setError(
+          `加载更早的记录失败：${cause instanceof Error ? cause.message : String(cause)}`,
+        );
+      });
+  }
+
+  // 只把本次新增的记录追加到分片存储：不再每次保存都把整份历史重新序列化。
+  function persistImageTurns(turns: ChatImage[]) {
+    if (!turns.length) return;
+    void window.api
+      .saveImageHistoryTurns({ turns })
+      .then((result) => {
+        // 新记录追加到末尾：总数变多，同时把已取偏移往前推等量，保持阅读位置序号不变。
+        setHistoryTotal(result.total);
+        setHistoryOffset((offset) => offset + result.added);
+        // 原图已经落盘：内存里换成缩略图，连续生成时内存不再随图片张数无限增长
+        // （复制、下载、查看大图、局部修改会按 id 重新读原图）。
+        const thumbs = new Map<string, string>();
+        for (const item of result.saved ?? []) {
+          if (item.thumb) thumbs.set(item.id, item.thumb);
+        }
+        if (thumbs.size) {
+          setImages((previous) =>
+            previous.map((item) => {
+              const thumb = thumbs.get(item.id);
+              return thumb ? { ...item, thumb, b64: undefined } : item;
+            }),
+          );
+        }
+      })
+      .catch((cause: unknown) => {
+        setError(
+          `保存聊天记录失败：${cause instanceof Error ? cause.message : String(cause)}`,
+        );
+      });
+  }
+
+  function handleChatScroll(event: React.UIEvent<HTMLDivElement>) {
+    const scroll = event.currentTarget;
+    // 离开底部就解除“贴住最新消息”，由用户决定看哪里。
+    if (
+      scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight >
+      CHAT_STICK_BOTTOM_SLACK
+    )
+      stickToBottomRef.current = false;
+    if (scroll.scrollTop > CHAT_LOAD_EARLIER_THRESHOLD) {
+      // 已经离开顶部，解除本轮的加载锁，下次滑到顶可以继续补页。
+      loadingEarlierRef.current = false;
+      return;
+    }
+    // 一页内容撑不满可视区时由 ResizeObserver 补页，这里不重复触发。
+    if (stickToBottomRef.current) return;
+    beginLoadEarlier(scroll);
+  }
+
+  // ResizeObserver 里的回调拿不到最新闭包，用 ref 转发一页未撑满屏幕时的补页判定。
+  const fillViewportRef = useRef<() => void>(() => {});
+  fillViewportRef.current = () => {
+    const scroll = chatRef.current;
+    if (!scroll || !hasEarlierImages) return;
+    // 一页内容还撑不满可视区时没有滚动条，用户无法“上滑”，需要继续补页。
+    if (scroll.scrollHeight - scroll.clientHeight > 4) return;
+    beginLoadEarlier(scroll);
+  };
 
   async function loadTemplateLibrary() {
     const [nextTemplates, nextCategories] = await Promise.all([
@@ -263,29 +439,14 @@ export default function AiImage({ active = true }: { active?: boolean }) {
           `加载模板库失败：${cause instanceof Error ? cause.message : String(cause)}`,
         );
     });
+    // 首屏只取最近一页（10 条）；更早的记录在用户上滑时按页从主进程取。
     void window.api
-      .getJson(IMAGE_HISTORY_STORAGE_KEY)
-      .then((history) => {
-        // 旧版本按倒序保存，读取时翻转并立即回写，后续统一按时间正序追加。
-        if (alive && Array.isArray(history)) {
-          const migrated = history.filter(isChatImage).reverse();
-          setImages(migrated);
-          void window.api
-            .setJson(IMAGE_HISTORY_STORAGE_KEY, {
-              version: 2,
-              images: migrated,
-            })
-            .catch(() => undefined);
-        } else if (
-          alive &&
-          history &&
-          typeof history === "object" &&
-          (history as { version?: unknown }).version === 2
-        ) {
-          const storedImages = (history as { images?: unknown }).images;
-          if (Array.isArray(storedImages))
-            setImages(storedImages.filter(isChatImage));
-        }
+      .getImageHistoryPage({ offset: 0, limit: IMAGE_HISTORY_PAGE_SIZE })
+      .then((page) => {
+        if (!alive) return;
+        setHistoryTotal(page.total);
+        setHistoryOffset(page.nextOffset);
+        setImages(page.turns.filter(isChatImage));
       })
       .catch((cause: unknown) => {
         if (alive)
@@ -334,13 +495,19 @@ export default function AiImage({ active = true }: { active?: boolean }) {
     };
   }, [selectedTemplate]);
 
+  // 只在「最新一条记录」变化时回到底部。向上懒加载是往前插入更早的记录，
+  // 最新一条不变，因此不能把用户从历史位置拉回底部。
+  const newestTurnId = images.length ? images[images.length - 1].id : "";
   useEffect(() => {
     if (!active || tab !== "chat") return;
     // The page stays mounted while hidden, so wait for it to become visible
     // before measuring scrollHeight and moving to the newest message.
+    // 主动回到底部后，之前懒加载更早记录用的锚点就失效了，清掉避免它把位置拉回去。
     const frame = window.requestAnimationFrame(() => {
       const scroll = chatRef.current;
       if (!scroll) return;
+      prependAnchorRef.current = null;
+      stickToBottomRef.current = true;
       scroll.scrollTo({ top: scroll.scrollHeight, behavior: "auto" });
       window.requestAnimationFrame(() => {
         if (chatRef.current)
@@ -348,7 +515,56 @@ export default function AiImage({ active = true }: { active?: boolean }) {
       });
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [active, tab, images.length, busy]);
+  }, [active, tab, newestTurnId, busy]);
+
+  // 连续生成不刷新页面时，内存里最多保留最近 MAX_CHAT_TURNS 条：
+  // 超出的从内存丢掉，磁盘上仍在，会重新变成「上滑可取」的更早记录。
+  // 只在仍停在最新消息处时裁剪，避免用户正翻看旧记录时内容被抽走。
+  useEffect(() => {
+    const overflow = images.length - MAX_CHAT_TURNS;
+    if (overflow <= 0 || !stickToBottomRef.current) return;
+    // 可视区还没被内容填满时（极短的历史）不裁剪，否则会和「补页撑满视口」互相拉扯。
+    const scroll = chatRef.current;
+    if (scroll && scroll.scrollHeight <= scroll.clientHeight) return;
+    setImages((previous) => previous.slice(overflow));
+    setHistoryOffset((offset) => Math.max(offset - overflow, 0));
+  }, [images.length]);
+
+  // 更早的记录插入顶部后重新校正一次滚动位置（首帧）；解码较慢的图片由
+  // 下方的 ResizeObserver 继续处理。
+  useLayoutEffect(() => {
+    const scroll = chatRef.current;
+    if (scroll && prependAnchorRef.current)
+      keepChatScrollAnchor(scroll, prependAnchorRef.current);
+    loadingEarlierRef.current = false;
+    setEarlierLoading(false);
+  }, [visibleStart]);
+
+  // 图片是异步解码的，加载完成后上方内容会继续变高；高度一变就补一次位置修正，
+  // 顺带处理“一页内容撑不满可视区、没有滚动条可上滑”的情况。
+  useEffect(() => {
+    const messages = messagesRef.current;
+    if (!messages || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      const scroll = chatRef.current;
+      if (!scroll) return;
+      if (prependAnchorRef.current) {
+        // 图片解码是成批的，一次可能顶上来好几屏；必须按锚点如实补足，
+        // 不能因为偏移看起来很大就放弃，否则用户会看到内容整体上跳。
+        keepChatScrollAnchor(scroll, prependAnchorRef.current);
+      } else if (stickToBottomRef.current) {
+        // 仍停在最新消息处时，上方内容变高要继续贴住底部。
+        const distance =
+          scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight;
+        if (distance > CHAT_STICK_BOTTOM_SLACK)
+          stickToBottomRef.current = false;
+        else scroll.scrollTop = scroll.scrollHeight;
+      }
+      fillViewportRef.current();
+    });
+    observer.observe(messages);
+    return () => observer.disconnect();
+  }, []);
 
   const promptWithTemplate = useMemo(() => {
     if (generationMode !== "template" || !selectedTemplate)
@@ -406,20 +622,27 @@ export default function AiImage({ active = true }: { active?: boolean }) {
             config?.imageModels?.[0];
           const maxResolution =
             model?.resolution ?? config?.imageMaxResolution ?? "1k";
+          // 4K 档位按网关的硬上限 3840 取「最大边」参考值：取 4096 会被
+          // 「width and height must not exceed 3840」直接拒绝；
+          // 最终发出的尺寸还要过 clampImageSize（16 的倍数 + 总像素区间）。
           const maxPixels =
             maxResolution === "4k"
-              ? 4096
+              ? IMAGE_MAX_EDGE
               : maxResolution === "2k"
                 ? 2048
                 : 1024;
-          let inferredSize = `${maxPixels}x${maxPixels}`;
+          const baseSize = `${maxPixels}x${maxPixels}`;
+          // 推断失败时的兜底尺寸同样必须先收敛（4K 的 3840×3840 总像素已超上限）。
+          let inferredSize = clampImageSize(baseSize, "1024x1024");
           try {
             const inferred = await window.api.runAiTask({
               task: "inferImageSize",
-              payload: { prompt: submittedPrompt, baseSize: inferredSize },
+              payload: { prompt: submittedPrompt, baseSize },
               runId,
             });
-            if (inferred?.size) inferredSize = inferred.size;
+            // 推断结果同样收敛到网关约束内，避免模型给出超大尺寸。
+            if (inferred?.size)
+              inferredSize = clampImageSize(inferred.size, inferredSize);
           } catch {
             /* 尺寸推断失败时使用模型默认尺寸 */
           }
@@ -431,46 +654,56 @@ export default function AiImage({ active = true }: { active?: boolean }) {
             ...templateReference,
             ...submittedReferences.map((item) => ({ dataUrl: item.dataUrl })),
           ];
+          // 带参考图/模板编辑时，输出尺寸要跟输入图一致：用户没有要求改尺寸，
+          // 就不能用档位推断尺寸去替换它。这里按输入图自身宽高取尺寸，
+          // 并收敛到网关允许的范围（16 的倍数、单边 ≤3840、总像素区间）。
+          let requestSize = inferredSize;
+          const sizeReference = allReferences[0]?.dataUrl;
+          if (sizeReference) {
+            try {
+              const dimensions = await imageDimensions(sizeReference);
+              if (signal.aborted) return;
+              requestSize = clampImageSize(
+                `${dimensions.width}x${dimensions.height}`,
+                inferredSize,
+              );
+            } catch {
+              /* 读不出输入图尺寸时退回档位推断尺寸 */
+            }
+          }
           const generated = allReferences.length
             ? await window.api.editImage({
                 prompt: submittedPrompt,
                 images: allReferences,
-                size: inferredSize,
+                size: requestSize,
                 model,
                 runId,
               })
             : await window.api.generateImage({
                 prompt: submittedPrompt,
-                size: inferredSize,
+                size: requestSize,
                 model,
                 runId,
               });
           if (signal.aborted) return;
+          // 在更新状态之前先算出本次新增的记录：保存只追加它们，避免副作用进 updater。
+          const completed = generated.map((image, index) => ({
+            ...image,
+            id: `${Date.now()}-${index}`,
+            prompt: submittedPrompt,
+            references: submittedReferences,
+          }));
           setImages((previous) => {
-            const completed = generated.map((image, index) => ({
-              ...image,
-              id: `${Date.now()}-${index}`,
-              prompt: submittedPrompt,
-              references: submittedReferences,
-            }));
             const at = previous.findIndex((item) => item.id === turnId);
-            const next =
-              at >= 0
-                ? [
-                    ...previous.slice(0, at),
-                    ...completed,
-                    ...previous.slice(at + 1),
-                  ]
-                : [...previous, ...completed];
-            void window.api
-              .setJson(IMAGE_HISTORY_STORAGE_KEY, { version: 2, images: next })
-              .catch((cause: unknown) => {
-                setError(
-                  `保存聊天记录失败：${cause instanceof Error ? cause.message : String(cause)}`,
-                );
-              });
-            return next;
+            return at >= 0
+              ? [
+                  ...previous.slice(0, at),
+                  ...completed,
+                  ...previous.slice(at + 1),
+                ]
+              : [...previous, ...completed];
           });
+          persistImageTurns(completed);
         } catch (cause: unknown) {
           if (signal.aborted) return;
           const message =
@@ -525,25 +758,14 @@ export default function AiImage({ active = true }: { active?: boolean }) {
           runId,
         });
         if (signal.aborted) return;
-        setImages((previous) => {
-          const next = [
-            ...previous,
-            ...generated.map((item, index) => ({
-              ...item,
-              id: `${Date.now()}-${index}`,
-              prompt: image.prompt,
-              references: image.references,
-            })),
-          ];
-          void window.api
-            .setJson(IMAGE_HISTORY_STORAGE_KEY, { version: 2, images: next })
-            .catch((cause: unknown) => {
-              setError(
-                `保存聊天记录失败：${cause instanceof Error ? cause.message : String(cause)}`,
-              );
-            });
-          return next;
-        });
+        const appended = generated.map((item, index) => ({
+          ...item,
+          id: `${Date.now()}-${index}`,
+          prompt: image.prompt,
+          references: image.references,
+        }));
+        setImages((previous) => [...previous, ...appended]);
+        persistImageTurns(appended);
       } catch (cause: unknown) {
         if (signal.aborted) return;
         setError(cause instanceof Error ? cause.message : String(cause));
@@ -605,21 +827,14 @@ export default function AiImage({ active = true }: { active?: boolean }) {
             ),
           );
           if (signal.aborted) return;
-          setImages((previous) => {
-            const next = [
-              ...previous,
-              ...protectedGenerated.map((item, index) => ({
-                ...item,
-                id: `${Date.now()}-${index}`,
-                prompt: `局部修改：${promptForEdit}`,
-                references: target.references,
-              })),
-            ];
-            void window.api
-              .setJson(IMAGE_HISTORY_STORAGE_KEY, { version: 2, images: next })
-              .catch(() => undefined);
-            return next;
-          });
+          const appended = protectedGenerated.map((item, index) => ({
+            ...item,
+            id: `${Date.now()}-${index}`,
+            prompt: `局部修改：${promptForEdit}`,
+            references: target.references,
+          }));
+          setImages((previous) => [...previous, ...appended]);
+          persistImageTurns(appended);
         } catch (cause: unknown) {
           if (signal.aborted) return;
           setError(cause instanceof Error ? cause.message : String(cause));
@@ -633,16 +848,25 @@ export default function AiImage({ active = true }: { active?: boolean }) {
     probe.src = source;
   }
 
-  function download(image: GeneratedImage, index: number) {
-    const anchor = document.createElement("a");
-    anchor.href = imageSrc(image);
-    anchor.download = `ai-image-${index + 1}.${(image.contentType || "image/png").split("/")[1] || "png"}`;
-    anchor.click();
+  async function download(image: ChatImage, index: number) {
+    try {
+      // 下载的是原图，不是聊天区那张缩略图。
+      const src = await originalSrc(image);
+      const anchor = document.createElement("a");
+      anchor.href = src;
+      anchor.download = `ai-image-${index + 1}.${(image.contentType || "image/png").split("/")[1] || "png"}`;
+      anchor.click();
+    } catch (cause: unknown) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
   }
 
-  async function copyImage(image: GeneratedImage) {
+  async function copyImage(image: ChatImage) {
+    let source = "";
     try {
-      const response = await fetch(imageSrc(image));
+      // 复制到剪贴板的必须是原图，不能用缩略图。
+      source = await originalSrc(image);
+      const response = await fetch(source);
       const blob = await response.blob();
       if (!navigator.clipboard?.write || typeof ClipboardItem === "undefined")
         throw new Error("当前环境不支持图片剪贴板");
@@ -654,13 +878,43 @@ export default function AiImage({ active = true }: { active?: boolean }) {
       setCopyStatus("图片已复制");
     } catch {
       try {
-        await navigator.clipboard.writeText(image.url || imageSrc(image));
+        await navigator.clipboard.writeText(source || image.url || imageSrc(image));
         setCopyStatus("图片地址已复制");
       } catch {
         setCopyStatus("复制失败，请手动下载");
       }
     }
     window.setTimeout(() => setCopyStatus(""), 2200);
+  }
+
+  // 局部修改的蒙版必须按原图尺寸生成，所以进入选区前先把原图取回来。
+  async function beginLocalEdit(image: ChatImage, index: number) {
+    try {
+      let withOriginal = image;
+      if (!image.b64 && !image.url) {
+        const turn = await window.api.getImageHistoryTurn({ id: image.id });
+        if (turn?.b64)
+          withOriginal = {
+            ...image,
+            b64: turn.b64,
+            contentType: turn.contentType || image.contentType,
+          };
+        else if (turn?.url) withOriginal = { ...image, url: turn.url };
+        else throw new Error("原图读取失败：磁盘上找不到这条记录");
+      }
+      setLocalEditTarget({ image: withOriginal, index });
+    } catch (cause: unknown) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }
+
+  // 查看大图也用原图：缩略图放大没有意义。
+  async function openViewer(image: ChatImage) {
+    try {
+      setViewerSrc({ src: await originalSrc(image), alt: image.prompt });
+    } catch (cause: unknown) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
   }
 
   function resizePromptTextarea(textarea?: HTMLTextAreaElement | null) {
@@ -808,8 +1062,12 @@ export default function AiImage({ active = true }: { active?: boolean }) {
         />
       ) : (
         <section className="ai-chat-shell">
-          <div className="ai-chat-scroll" ref={chatRef}>
-            <div className="ai-chat-messages">
+          <div
+            className="ai-chat-scroll"
+            ref={chatRef}
+            onScroll={handleChatScroll}
+          >
+            <div className="ai-chat-messages" ref={messagesRef}>
               {historyLoading && (
                 <div className="ai-chat-history-loading">
                   <Spinner text="加载聊天记录…" />
@@ -822,94 +1080,113 @@ export default function AiImage({ active = true }: { active?: boolean }) {
                   <p>描述画面，或上传参考图后进行编辑。</p>
                 </div>
               )}
-              {images.map((image, index) => (
-                <div className="ai-chat-turn" key={image.id}>
-                  <div className="ai-chat-user">
-                    <span className="ai-chat-bubble-label">你</span>
-                    <div>{image.prompt}</div>
-                    {!!image.references?.length && (
-                      <div className="ai-chat-user-references">
-                        {image.references.map((reference, referenceIndex) => (
-                          <img
-                            key={`${reference.name}-${referenceIndex}`}
-                            src={reference.dataUrl}
-                            alt={reference.name}
-                          />
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                  <div className="ai-chat-assistant">
-                    <span className="ai-chat-bubble-label">AI</span>
-                    {image.pending && (
-                      <div className="ai-chat-status">
-                        <Spinner /> 图片模型正在处理…
-                      </div>
-                    )}
-                    {image.error && (
-                      <div className="ai-chat-error-output">{image.error}</div>
-                    )}
-                    {!image.pending && !image.error && (
-                      <figure className="ai-chat-image-card">
-                        <img
-                          src={imageSrc(image)}
-                          alt={image.prompt}
-                          onClick={() =>
-                            setViewerSrc({
-                              src: imageSrc(image),
-                              alt: image.prompt,
-                            })
-                          }
-                          role="button"
-                          tabIndex={0}
-                          onKeyDown={(event) => {
-                            if (event.key === "Enter" || event.key === " ") {
-                              event.preventDefault();
-                              setViewerSrc({
-                                src: imageSrc(image),
-                                alt: image.prompt,
-                              });
-                            }
-                          }}
-                          onLoad={() => {
-                            if (active && tab === "chat" && chatRef.current)
-                              chatRef.current.scrollTop =
-                                chatRef.current.scrollHeight;
-                          }}
-                        />
-                        <div className="ai-chat-image-tools">
-                          <button
-                            className="mini"
-                            onClick={() => regenerate(image)}
-                            disabled={busy}
-                          >
-                            重新生成
-                          </button>
-                          <button
-                            className="mini"
-                            onClick={() => setLocalEditTarget({ image, index })}
-                            disabled={busy}
-                          >
-                            局部修改
-                          </button>
-                          <button
-                            className="mini"
-                            onClick={() => void copyImage(image)}
-                          >
-                            复制
-                          </button>
-                          <button
-                            className="mini"
-                            onClick={() => download(image, index)}
-                          >
-                            下载
-                          </button>
-                        </div>
-                      </figure>
-                    )}
-                  </div>
+              {!historyLoading && hasEarlierImages && (
+                <div className="ai-chat-earlier-hint" role="status">
+                  {earlierLoading
+                    ? "正在加载更早的记录…"
+                    : `上滑加载更早的记录（还有 ${visibleStart} 条）`}
                 </div>
-              ))}
+              )}
+              {images.map((image, index) => {
+                const absoluteIndex = visibleStart + index;
+                const isLatestTurn = index === images.length - 1;
+                return (
+                  <div
+                    className="ai-chat-turn"
+                    key={image.id}
+                    data-turn-id={image.id}
+                  >
+                    <div className="ai-chat-user">
+                      <span className="ai-chat-bubble-label">你</span>
+                      <div>{image.prompt}</div>
+                      {!!image.references?.length && (
+                        <div className="ai-chat-user-references">
+                          {image.references.map((reference, referenceIndex) => (
+                            <img
+                              key={`${reference.name}-${referenceIndex}`}
+                              src={reference.dataUrl}
+                              alt={reference.name}
+                              loading="lazy"
+                              decoding="async"
+                            />
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                    <div className="ai-chat-assistant">
+                      <span className="ai-chat-bubble-label">AI</span>
+                      {image.pending && (
+                        <div className="ai-chat-status">
+                          <Spinner /> 图片模型正在处理…
+                        </div>
+                      )}
+                      {image.error && (
+                        <div className="ai-chat-error-output">{image.error}</div>
+                      )}
+                      {!image.pending && !image.error && (
+                        <figure className="ai-chat-image-card">
+                          <img
+                            src={displaySrc(image)}
+                            alt={image.prompt}
+                            loading="lazy"
+                            decoding="async"
+                            onClick={() => void openViewer(image)}
+                            role="button"
+                            tabIndex={0}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter" || event.key === " ") {
+                                event.preventDefault();
+                                void openViewer(image);
+                              }
+                            }}
+                            onLoad={() => {
+                              // 只有最新一条图片加载完才回到底部；
+                              // 更早的记录解码完成时不能把用户拉走。
+                              if (!active || tab !== "chat" || !isLatestTurn)
+                                return;
+                              prependAnchorRef.current = null;
+                              stickToBottomRef.current = true;
+                              if (chatRef.current)
+                                chatRef.current.scrollTop =
+                                  chatRef.current.scrollHeight;
+                            }}
+                          />
+                          <div className="ai-chat-image-tools">
+                            <button
+                              className="mini"
+                              onClick={() => regenerate(image)}
+                              disabled={busy}
+                            >
+                              重新生成
+                            </button>
+                            <button
+                              className="mini"
+                              onClick={() =>
+                                void beginLocalEdit(image, absoluteIndex)
+                              }
+                              disabled={busy}
+                            >
+                              局部修改
+                            </button>
+                            <button
+                              className="mini"
+                              onClick={() => void copyImage(image)}
+                            >
+                              复制
+                            </button>
+                            <button
+                              className="mini"
+                              onClick={() => void download(image, absoluteIndex)}
+                            >
+                              下载
+                            </button>
+                          </div>
+                        </figure>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           </div>
           <div className="ai-chat-composer">

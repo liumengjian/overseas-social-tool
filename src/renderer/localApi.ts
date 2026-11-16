@@ -4,7 +4,7 @@
 // 内存接口，使页面可正常挂载并呈现「空状态」。所有列表返回空数组，不填充任何示例数据。
 // 真实桌面端由 preload 注入 window.api（经 IPC 调用主进程，可接真实数据 / 大模型）。
 
-import { IpcApi, RenderResult } from '../shared/ipc';
+import { IpcApi, ImageHistoryPage, ImageHistoryTurn, RenderResult } from '../shared/ipc';
 import { AppConfig, AiTaskName, SocialVideo, TrendTopic, HashtagStat, VideoComment } from '../shared/types';
 import { EditMaterial, EditPlan, EditGenerationOptions } from '../analysis/ai-edit';
 
@@ -167,6 +167,16 @@ export function createLocalApi(): IpcApi {
     // 浏览器预览模式：内存兜底，不持久化（真实持久化由桌面端 preload 经 IPC 完成）
     getJson: () => delay<any>(null),
     setJson: () => delay<void>(undefined),
+    // 浏览器预览没有本地历史分片存储：返回空历史，保存走空实现。
+    getImageHistoryPage: () =>
+      delay<ImageHistoryPage>({ total: 0, turns: [], nextOffset: 0 }),
+    saveImageHistoryTurns: () =>
+      delay<{ total: number; added: number; saved: Array<{ id: string; thumb?: string }> }>({
+        total: 0,
+        added: 0,
+        saved: [],
+      }),
+    getImageHistoryTurn: () => delay<ImageHistoryTurn | null>(null),
     listImageTemplateCategories: () => {
       throw new Error('浏览器预览模式不支持数据库模板库，请在 Electron 桌面端运行。');
     },

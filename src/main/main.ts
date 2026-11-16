@@ -29,6 +29,7 @@ import {
   saveUserConfig,
 } from "../data";
 import { mediaDir, readJson, writeJson } from "../data/store";
+import { pageImageHistory, readImageHistoryTurn, saveImageHistoryTurns } from "../data/image-history";
 import { MiniMaxClient } from "../data/minimax";
 import { TikHubClient } from "../data/tikhub-client";
 import { MysqlCache } from "../data/mysql-cache";
@@ -425,6 +426,21 @@ function registerIpc() {
     }
     writeJson(key, value);
   });
+  // AI 生图聊天记录走「索引 + 每条一个文件」的分片存储：按页读取、只追加新记录，
+  // 避免每次打开页面都整体解析 / 传输 / 重写整份历史。
+  ipcMain.handle(
+    IPC_CHANNELS.getImageHistoryPage,
+    (_e, args: { offset?: number; limit?: number }) =>
+      pageImageHistory(args ?? {}),
+  );
+  ipcMain.handle(
+    IPC_CHANNELS.saveImageHistoryTurns,
+    (_e, args: { turns?: unknown[] }) =>
+      saveImageHistoryTurns(Array.isArray(args?.turns) ? args.turns : []),
+  );
+  ipcMain.handle(IPC_CHANNELS.getImageHistoryTurn, (_e, args: { id?: string }) =>
+    readImageHistoryTurn(args?.id),
+  );
   // AI 生图模板与分类是可共享的业务数据，仅保存至 MySQL；MysqlCache 的模板方法
   // 会在数据库未配置或不可用时抛出明确错误，禁止降级写入本地 JSON。
   ipcMain.handle(IPC_CHANNELS.listImageTemplateCategories, () =>

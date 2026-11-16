@@ -247,6 +247,7 @@ export async function generateImage(
     prompt: guardedPrompt,
     ...(size ? { size } : {}),
     quality: 'high',
+    // 内容审核等级固定为 low（放在高级参数之后，覆盖其中同名设置）。
     moderation: 'low'
   };
   return request(
@@ -286,6 +287,7 @@ export async function editImage(
       prompt: guardedPrompt,
       ...(args.size ? { size: args.size } : {}),
       quality: 'high',
+      // 内容审核等级固定为 low（放在高级参数之后，覆盖其中同名设置）。
       moderation: 'low'
     };
     if (style === "string") body.image = sources[0];
@@ -296,6 +298,9 @@ export async function editImage(
 
   const form = new FormData();
   appendAdvanced(form, params);
+  // 内容审核等级统一固定为 low：multipart 与 JSON 两条路径保持一致，
+  // 且覆盖「图片模型高级参数」里可能填写的同名字段（appendAdvanced 先写，这里用 set 覆盖）。
+  form.set("moderation", "low");
   form.set("model", config.imageModel.trim());
   form.set("system", IMAGE_SYSTEM_PROMPT);
   form.set(

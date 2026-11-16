@@ -49,6 +49,34 @@ export interface GeneratedImage {
   contentType: string;
 }
 
+// AI 生图聊天记录（分片存储：索引 + 每条一个文件，渲染进程按页取用）
+export interface ImageHistoryReference {
+  name: string;
+  dataUrl: string;
+}
+
+export interface ImageHistoryTurn {
+  id: string;
+  prompt: string;
+  contentType: string;
+  // 原图（复制、下载、局部修改、查看大图时必须用它）
+  b64?: string;
+  url?: string;
+  error?: string;
+  // 聊天区展示用的缩略图（分页读取时只回传它，原图按需单独取）
+  thumb?: string;
+  references?: ImageHistoryReference[];
+}
+
+export interface ImageHistoryPage {
+  // 历史记录总条数（用于「还有 N 条」提示）
+  total: number;
+  // 本次取到的记录，时间正序（旧 → 新）
+  turns: ImageHistoryTurn[];
+  // 下次继续往前取时应使用的偏移（已消费的历史条数）
+  nextOffset: number;
+}
+
 export interface ImageTemplateCategory {
   id: string;
   name: string;
@@ -249,6 +277,22 @@ export interface IpcApi {
   // 通用本地持久化（页面操作数据，跨重启保留）：key 仅允许字母数字/下划线/连字符
   getJson: (key: string) => Promise<any>;
   setJson: (key: string, value: any) => Promise<void>;
+  // AI 生图聊天记录：按页读取（offset 为已加载条数，0 表示最新一页）
+  getImageHistoryPage: (args: {
+    offset?: number;
+    limit?: number;
+  }) => Promise<ImageHistoryPage>;
+  // 只追加新生成的记录，避免每次保存都重写整份历史；返回新写入记录的缩略图，
+  // 让渲染层把内存里的原图换成缩略图（原图已落盘，按 id 仍可取回）。
+  saveImageHistoryTurns: (args: {
+    turns: ImageHistoryTurn[];
+  }) => Promise<{
+    total: number;
+    added: number;
+    saved: Array<{ id: string; thumb?: string }>;
+  }>;
+  // 按 id 取单条记录（含原图），用于复制、下载、查看大图、局部修改
+  getImageHistoryTurn: (args: { id: string }) => Promise<ImageHistoryTurn | null>;
   // AI 生图模板是业务数据，统一保存至 MySQL；未配置/连接失败会明确返回错误，不回退本地 JSON。
   listImageTemplateCategories: () => Promise<ImageTemplateCategory[]>;
   createImageTemplateCategory: (args: {
@@ -425,6 +469,9 @@ export const IPC_CHANNELS = {
   resetConfig: "resetConfig",
   getJson: "getJson",
   setJson: "setJson",
+  getImageHistoryPage: "getImageHistoryPage",
+  saveImageHistoryTurns: "saveImageHistoryTurns",
+  getImageHistoryTurn: "getImageHistoryTurn",
   listImageTemplateCategories: "listImageTemplateCategories",
   createImageTemplateCategory: "createImageTemplateCategory",
   updateImageTemplateCategory: "updateImageTemplateCategory",

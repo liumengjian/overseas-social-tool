@@ -60,6 +60,12 @@ const api: IpcApi = {
   resetConfig: () => ipcRenderer.invoke(IPC_CHANNELS.resetConfig),
   getJson: (key) => ipcRenderer.invoke(IPC_CHANNELS.getJson, key),
   setJson: (key, value) => ipcRenderer.invoke(IPC_CHANNELS.setJson, key, value),
+  getImageHistoryPage: (args) =>
+    ipcRenderer.invoke(IPC_CHANNELS.getImageHistoryPage, args),
+  saveImageHistoryTurns: (args) =>
+    ipcRenderer.invoke(IPC_CHANNELS.saveImageHistoryTurns, args),
+  getImageHistoryTurn: (args) =>
+    ipcRenderer.invoke(IPC_CHANNELS.getImageHistoryTurn, args),
   listImageTemplateCategories: () =>
     ipcRenderer.invoke(IPC_CHANNELS.listImageTemplateCategories),
   createImageTemplateCategory: (args) =>
