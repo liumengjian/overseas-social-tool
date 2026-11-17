@@ -306,6 +306,13 @@ export default function AiImage({ active = true }: { active?: boolean }) {
   const [localEditTarget, setLocalEditTarget] =
     useState<LocalEditTarget | null>(null);
   const [copyStatus, setCopyStatus] = useState("");
+  // 右键点自己发的图片时的菜单（只复制这一张）。
+  const [referenceMenu, setReferenceMenu] = useState<{
+    left: number;
+    top: number;
+    reference: TemplateImage;
+  } | null>(null);
+  const referenceMenuRef = useRef<HTMLDivElement | null>(null);
   const [dragActive, setDragActive] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const chatRef = useRef<HTMLDivElement>(null);
@@ -861,6 +868,142 @@ export default function AiImage({ active = true }: { active?: boolean }) {
     }
   }
 
+  // 右键菜单：点外部、Esc、滚动、窗口尺寸变化都关掉，避免菜单停在错误位置。
+  useEffect(() => {
+    if (!referenceMenu) return;
+    const closeIfOutside = (event: Event) => {
+      if (
+        event.type === "pointerdown" &&
+        referenceMenuRef.current?.contains(event.target as Node)
+      )
+        return;
+      setReferenceMenu(null);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setReferenceMenu(null);
+    };
+    // 键盘触发的右键菜单也要能直接操作。
+    referenceMenuRef.current?.querySelector("button")?.focus();
+    const chat = chatRef.current;
+    window.addEventListener("pointerdown", closeIfOutside);
+    window.addEventListener("resize", closeIfOutside);
+    window.addEventListener("keydown", closeOnEscape);
+    chat?.addEventListener("scroll", closeIfOutside, { passive: true });
+    return () => {
+      window.removeEventListener("pointerdown", closeIfOutside);
+      window.removeEventListener("resize", closeIfOutside);
+      window.removeEventListener("keydown", closeOnEscape);
+      chat?.removeEventListener("scroll", closeIfOutside);
+    };
+  }, [referenceMenu]);
+
+  function flashCopyStatus(status: string) {
+    setCopyStatus(status);
+    window.setTimeout(() => setCopyStatus(""), 2200);
+  }
+
+  // 参考图是任意格式的 dataURL，而剪贴板里可靠的图片格式只有 png，先统一转成 png。
+  function dataUrlToPngBlob(dataUrl: string): Promise<Blob> {
+    return new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => {
+        const canvas = document.createElement("canvas");
+        canvas.width = image.naturalWidth;
+        canvas.height = image.naturalHeight;
+        const context = canvas.getContext("2d");
+        if (!context) {
+          reject(new Error("无法创建画布"));
+          return;
+        }
+        context.drawImage(image, 0, 0);
+        canvas.toBlob(
+          (blob) => (blob ? resolve(blob) : reject(new Error("图片转换失败"))),
+          "image/png",
+        );
+      };
+      image.onerror = () => reject(new Error("无法读取图片"));
+      image.src = dataUrl;
+    });
+  }
+
+  // 悬浮在消息上的按钮只复制图片：系统剪贴板一次粘贴只能落一种格式，
+  // 文字和图片放进同一次写入必然互相抢（用户两次实测都只落了一种），
+  // 所以这里明确只写图片；只想要文字时用鼠标选中文字复制即可。
+  async function copyUserMessageImage(image: ChatImage) {
+    const references = image.references ?? [];
+    if (!references.length) {
+      flashCopyStatus("这条消息没有图片");
+      return;
+    }
+    if (!navigator.clipboard?.write || typeof ClipboardItem === "undefined") {
+      try {
+        await navigator.clipboard.writeText(references[0].dataUrl);
+        flashCopyStatus("图片地址已复制");
+      } catch {
+        flashCopyStatus("复制失败，请右键另存");
+      }
+      return;
+    }
+    const pngBlobs: Blob[] = [];
+    for (const reference of references) {
+      try {
+        pngBlobs.push(await dataUrlToPngBlob(reference.dataUrl));
+      } catch {
+        /* 单张读取失败先跳过，剩下的还能复制 */
+      }
+    }
+    if (!pngBlobs.length) {
+      flashCopyStatus("图片读取失败，请右键另存");
+      return;
+    }
+    try {
+      await navigator.clipboard.write(
+        pngBlobs.map((blob) => new ClipboardItem({ "image/png": blob })),
+      );
+      flashCopyStatus(
+        pngBlobs.length > 1 ? `已复制 ${pngBlobs.length} 张图片` : "图片已复制",
+      );
+      return;
+    } catch {
+      /* 多张一起写不一定被支持，退成只写第一张 */
+    }
+    try {
+      await navigator.clipboard.write([
+        new ClipboardItem({ "image/png": pngBlobs[0] }),
+      ]);
+      flashCopyStatus(
+        pngBlobs.length > 1
+          ? `已复制第 1 张图片（共 ${pngBlobs.length} 张）`
+          : "图片已复制",
+      );
+    } catch {
+      try {
+        await navigator.clipboard.writeText(references[0].dataUrl);
+        flashCopyStatus("图片地址已复制");
+      } catch {
+        flashCopyStatus("复制失败，请右键另存");
+      }
+    }
+  }
+
+  // 右键菜单里单独复制某一张自己发的图片。
+  async function copyReferenceImage(reference: TemplateImage) {
+    try {
+      const blob = await dataUrlToPngBlob(reference.dataUrl);
+      if (!navigator.clipboard?.write || typeof ClipboardItem === "undefined")
+        throw new Error("当前环境不支持图片剪贴板");
+      await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+      flashCopyStatus("图片已复制");
+    } catch {
+      try {
+        await navigator.clipboard.writeText(reference.dataUrl);
+        flashCopyStatus("图片地址已复制");
+      } catch {
+        flashCopyStatus("复制失败，请手动下载");
+      }
+    }
+  }
+
   async function copyImage(image: ChatImage) {
     let source = "";
     try {
@@ -1096,20 +1239,41 @@ export default function AiImage({ active = true }: { active?: boolean }) {
                     key={image.id}
                     data-turn-id={image.id}
                   >
-                    <div className="ai-chat-user">
-                      <span className="ai-chat-bubble-label">你</span>
-                      <div>{image.prompt}</div>
+                    <div className="ai-chat-user-wrap">
+                      <div className="ai-chat-user">
+                        <span className="ai-chat-bubble-label">你</span>
+                        <div>{image.prompt}</div>
+                        {!!image.references?.length && (
+                          <div className="ai-chat-user-references">
+                            {image.references.map((reference, referenceIndex) => (
+                              <img
+                                key={`${reference.name}-${referenceIndex}`}
+                                src={reference.dataUrl}
+                                alt={reference.name}
+                                loading="lazy"
+                                decoding="async"
+                                onContextMenu={(event) => {
+                                  event.preventDefault();
+                                  setReferenceMenu({
+                                    left: Math.min(event.clientX, window.innerWidth - 132),
+                                    top: Math.min(event.clientY, window.innerHeight - 56),
+                                    reference,
+                                  });
+                                }}
+                              />
+                            ))}
+                          </div>
+                        )}
+                      </div>
                       {!!image.references?.length && (
-                        <div className="ai-chat-user-references">
-                          {image.references.map((reference, referenceIndex) => (
-                            <img
-                              key={`${reference.name}-${referenceIndex}`}
-                              src={reference.dataUrl}
-                              alt={reference.name}
-                              loading="lazy"
-                              decoding="async"
-                            />
-                          ))}
+                        <div className="ai-chat-user-tools">
+                          <button
+                            className="mini"
+                            onClick={() => void copyUserMessageImage(image)}
+                            title="复制这条消息里的图片"
+                          >
+                            复制图片
+                          </button>
                         </div>
                       )}
                     </div>
@@ -1384,6 +1548,27 @@ export default function AiImage({ active = true }: { active?: boolean }) {
           onClose={() => setLocalEditTarget(null)}
           onSubmit={submitLocalEdit}
         />
+      )}
+      {referenceMenu && (
+        <div
+          className="ai-context-menu"
+          ref={referenceMenuRef}
+          role="menu"
+          aria-label="图片操作"
+          style={{ left: referenceMenu.left, top: referenceMenu.top }}
+        >
+          <button
+            className="ai-context-menu-item"
+            role="menuitem"
+            onClick={() => {
+              const { reference } = referenceMenu;
+              setReferenceMenu(null);
+              void copyReferenceImage(reference);
+            }}
+          >
+            复制
+          </button>
+        </div>
       )}
       {copyStatus && (
         <div className="ai-image-toast" role="status">

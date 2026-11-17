@@ -2568,15 +2568,62 @@ code {
   gap: 10px;
   width: 100%;
 }
-.ai-chat-user {
+/* 自己发的消息：外层负责右对齐并给「复制」按钮预留高度，悬浮时只改透明度，列表不会跳动 */
+.ai-chat-user-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
   justify-self: end;
   max-width: min(72%, 620px);
+}
+.ai-chat-user {
+  max-width: 100%;
   padding: 10px 14px;
   border: 1px solid rgba(79, 140, 255, 0.28);
   border-radius: 8px 8px 2px 8px;
   background: rgba(79, 140, 255, 0.11);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+.ai-chat-user-tools {
+  display: flex;
+  min-height: 24px;
+  margin-top: 4px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease;
+}
+.ai-chat-user-wrap:hover .ai-chat-user-tools,
+.ai-chat-user-wrap:focus-within .ai-chat-user-tools {
+  opacity: 1;
+  pointer-events: auto;
+}
+.ai-context-menu {
+  position: fixed;
+  z-index: 230;
+  min-width: 112px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--panel2);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
+}
+.ai-context-menu-item {
+  display: block;
+  width: 100%;
+  padding: 7px 12px;
+  border: 0;
+  border-radius: 5px;
+  color: var(--text);
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.ai-context-menu-item:hover,
+.ai-context-menu-item:focus-visible {
+  background: rgba(79, 140, 255, 0.14);
+  outline: none;
 }
 .ai-chat-assistant {
   justify-self: start;
