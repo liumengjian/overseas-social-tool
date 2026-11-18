@@ -153,7 +153,7 @@ export function TracePanel({ steps }: { steps: TraceStep[] }) {
                             ? "Whisper"
                             : s.kind === "text"
                               ? "文本分析"
-                              : "视频解析大模型"}
+                              : "AI 模型"}
                 </span>
                 <span className="trace-title">{s.title}</span>
                 <span className={`trace-status ${s.ok ? "ok" : "err"}`}>
@@ -246,7 +246,7 @@ export function Pipeline({
                         ? "Whisper"
                         : s.kind === "text"
                           ? "文本分析"
-                          : "视频解析大模型"}
+                          : "AI 模型"}
             </span>
             <div className="pl-main">
               <div className="pl-line">
@@ -301,7 +301,8 @@ export function Pipeline({
       {state.aiText && (
         <div className="pl-ai">
           <div className="pl-ai-head">
-            视频解析大模型实时输出
+            {title ? `${title} · ` : ""}
+            大模型实时输出
             {state.loading && <span className="pl-live">● 流式生成中</span>}
           </div>
           <pre className="pl-ai-text">

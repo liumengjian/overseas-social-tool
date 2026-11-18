@@ -184,7 +184,7 @@ export default function WorkflowDock() {
                                         ? "Whisper"
                                         : s.kind === "text"
                                           ? "文本分析"
-                                          : "视频解析大模型"}
+                                          : "AI 模型"}
                           </span>
                           {typeof s.params?.platform === "string" && (
                             <span className="wd-platform-card">
@@ -251,7 +251,8 @@ export default function WorkflowDock() {
                   {active.aiText && (
                     <div className="wd-ai">
                       <div className="wd-ai-head">
-                        视频解析大模型实时输出
+                        {active.module ? `${active.module} · ` : ""}
+                        大模型实时输出
                         {active.status === "running" && (
                           <span className="wd-live"> ●</span>
                         )}
